@@ -206,6 +206,9 @@ files += [
 ]
 
 includes += include_directories('src')
+# Chessckers variant+NN core (vendored from engine/cpp). Header-only; its headers
+# cross-reference each other by bare name (#include "board.hpp"), so expose the dir.
+includes += include_directories('src/chessckers')
 
 deps += dependency('absl_flat_hash_map', 'absl', modules:['absl::flat_hash_map'],
                    include_type: 'system',
