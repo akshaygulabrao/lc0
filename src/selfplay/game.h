@@ -62,6 +62,10 @@ struct PlayerOptions {
   SelfPlayLimits search_limits;
 };
 
+// Chessckers training-data collector (pimpl; keeps the cc:: engine headers out
+// of game.h). Defined in game.cc.
+struct ChesskersGameData;
+
 // Plays a single game vs itself.
 class SelfPlayGame {
  public:
@@ -71,6 +75,7 @@ class SelfPlayGame {
   // and white (useful i.e. when they use different networks).
   SelfPlayGame(PlayerOptions white, PlayerOptions black, bool shared_tree,
                const Opening& opening);
+  ~SelfPlayGame();
 
   // Populate command line options that it uses.
   static void PopulateUciParams(OptionsParser* options);
@@ -111,6 +116,10 @@ class SelfPlayGame {
   bool abort_ = false;
   GameResult game_result_ = GameResult::UNDECIDED;
   bool adjudicated_ = false;
+  // Chessckers self-play training data (cc::chunk records), collected during
+  // Play() when training; written as a gzipped-JSON ccz1 chunk by
+  // WriteTrainingData(). pimpl so the cc:: engine headers stay out of game.h.
+  std::unique_ptr<ChesskersGameData> cc_data_;
   // Track minimum eval for each player so that GetWorstEvalForWinnerOrDraw()
   // can be calculated after end of game.
   float min_eval_[2] = {1.0f, 1.0f};

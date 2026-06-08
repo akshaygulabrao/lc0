@@ -28,12 +28,24 @@
 #include "selfplay/game.h"
 
 #include <algorithm>
+#include <fstream>
 
+#include "chessckers/chunk.hpp"         // cc::encode_chunk (ccz1 gzipped JSON)
+#include "chessckers/native_move.hpp"   // cc::NativeMove
+#include "chessckers/selfplay.hpp"      // cc::PureGame / PureRecord
 #include "search/classic/stoppers/common.h"
 #include "search/classic/stoppers/factory.h"
 #include "utils/random.h"
 
 namespace lczero {
+
+// Chessckers self-play training data: the per-game cc::chunk record set. Held by
+// pimpl so the cc:: engine headers stay out of game.h.
+struct ChesskersGameData {
+  cc::PureGame game;
+};
+
+SelfPlayGame::~SelfPlayGame() = default;
 
 namespace {
 const OptionId kReuseTreeId{"reuse-tree", "ReuseTree",
@@ -88,6 +100,7 @@ SelfPlayGame::SelfPlayGame(PlayerOptions white, PlayerOptions black,
                      classic::SearchParams(*black.uci_options).GetHistoryFill(),
                      pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE) {
   orig_fen_ = opening.start_fen;
+  cc_data_ = std::make_unique<ChesskersGameData>();
   tree_[0] = std::make_shared<classic::NodeTree>();
   tree_[0]->ResetToPosition(orig_fen_, {});
 
@@ -268,32 +281,19 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     }
 
     if (training) {
-      bool best_is_proof = best_is_terminal;  // But check for better moves.
-      if (best_is_proof && best_eval.wl < 1) {
-        auto best =
-            (best_eval.wl == 0) ? GameResult::DRAW : GameResult::BLACK_WON;
-        auto upper = best;
-        for (const auto& edge : node->Edges()) {
-          upper = std::max(edge.GetBounds().second, upper);
-        }
-        if (best < upper) {
-          best_is_proof = false;
-        }
+      // Chessckers training data: record the search root's per-move visit counts
+      // as a cc::chunk PureRecord. lc0's V6 training_data_.Add is intentionally
+      // skipped here -- it runs through the stubbed chess encoder (empty planes,
+      // which would crash) and is replaced by the cc::chunk written in
+      // WriteTrainingData(). node == tree_[idx]->GetCurrentHead() (searched root).
+      cc::PureRecord rec;
+      rec.fen = BoardToFen(tree_[idx]->GetPositionHistory().Last().GetBoard());
+      rec.side_white = !tree_[idx]->IsBlackToMove();
+      for (const auto& edge : node->Edges()) {
+        rec.legal.push_back(*edge.GetMove(false).native());
+        rec.visits.push_back(static_cast<int>(edge.GetN()));
       }
-      // Append training data. The GameResult is later overwritten.
-      std::vector<Move> legal_moves = tree_[idx]
-                                          ->GetPositionHistory()
-                                          .Last()
-                                          .GetBoard()
-                                          .GenerateLegalMoves();
-      std::optional<EvalResult> nneval =
-          options_[idx].backend->GetCachedEvaluation(EvalPosition{
-              tree_[idx]->GetPositionHistory().GetPositions(), legal_moves});
-      training_data_.Add(tree_[idx]->GetCurrentHead(),
-                         tree_[idx]->GetPositionHistory(), best_eval,
-                         played_eval, best_is_proof, best_move, move,
-                         legal_moves, nneval,
-                         search_->GetParams().GetPolicySoftmaxTemp());
+      cc_data_->game.records.push_back(std::move(rec));
     }
     // Must reset the search before mutating the tree.
     search_.reset();
@@ -349,7 +349,22 @@ void SelfPlayGame::Abort() {
 }
 
 void SelfPlayGame::WriteTrainingData(TrainingDataWriter* writer) const {
-  training_data_.Write(writer, game_result_, adjudicated_);
+  // Chessckers: emit a cc::chunk (gzipped-JSON "ccz1") instead of lc0's V6 binary
+  // (the V6 path runs through the stubbed encoder). The records were collected per
+  // ply in Play(); set the game outcome (from White's frame) and encode.
+  cc::PureGame game = cc_data_->game;  // copy the per-ply records
+  game.outcome = game_result_ == GameResult::WHITE_WON   ? "white"
+                 : game_result_ == GameResult::BLACK_WON ? "black"
+                                                         : "draw";
+  game.final_status = adjudicated_ ? "adjudicated" : "";
+  const std::string chunk = cc::encode_chunk(game);  // already gzipped
+
+  // Reuse the writer's managed file path: close its (empty) .gz, then overwrite
+  // with the cc chunk bytes (also gzip — readable by the Python trainer).
+  const std::string path = writer->GetFileName();
+  writer->Finalize();
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
 }
 
 std::unique_ptr<classic::ChainedSearchStopper>
