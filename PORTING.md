@@ -1,5 +1,37 @@
 # Porting lc0 → akshay-chessckers-0
 
+## STATUS (live)
+
+**Builds, links, and PLAYS chessckers via lc0's classic MCTS + the chessckers
+backend.** Done & verified: P0 rename; P1 board/move/position adapter (parity test);
+P2 build-green; P3 NN backend (eval parity test + runtime); P4 search integration
+(plays both the chess and checkers sides, opening double-move handled).
+Remaining for full parity: **P5** self-play training-data output via `cc::chunk`
+(currently the encoder is stubbed → `selfplay` runs but writes invalid chunks);
+**P6** longer end-to-end parity vs the reference + perf (CPU nps is low; no GPU
+batching yet through the lc0 backend).
+
+### Build & run (macOS / Apple)
+```
+cd akshay-chessckers-0
+meson setup build           # dag_classic defaults off now
+meson configure build -Dblas=false -Dmetal=disabled -Dbuild_backends=false \
+                      -Dgtest=false -Ddefault_backend=chessckers
+ninja -C build
+# play:
+printf 'position startpos\ngo nodes 100\n' | \
+  ./build/akshay-chessckers-0 --backend=chessckers --weights=<path/to/net.bin>
+```
+Standalone parity tests (no full build needed):
+```
+clang++ -std=c++20 -O2 -Isrc -Isrc/chessckers -DACCELERATE_NEW_LAPACK \
+  tests_chessckers/<board_adapter|eval>_test.cc src/chess/board.cc src/chess/position.cc \
+  -framework Accelerate -o /tmp/t && /tmp/t [<net.bin> for eval_test]
+```
+
+---
+
+
 Converting the lc0 chess engine to play **Chessckers** (10×10-path checkers-vs-chess
 hybrid; see `engine/chessckers.md` in the chessckers repo for the rules). This doc is
 the authoritative design + checklist for the port so the "~10 things we can get wrong"
