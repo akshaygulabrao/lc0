@@ -1,15 +1,22 @@
 # Porting lc0 → akshay-chessckers-0
 
-## STATUS (live)
+## STATUS (live) — FULL PARITY REACHED
 
-**Builds, links, and PLAYS chessckers via lc0's classic MCTS + the chessckers
-backend.** Done & verified: P0 rename; P1 board/move/position adapter (parity test);
-P2 build-green; P3 NN backend (eval parity test + runtime); P4 search integration
-(plays both the chess and checkers sides, opening double-move handled).
-Remaining for full parity: **P5** self-play training-data output via `cc::chunk`
-(currently the encoder is stubbed → `selfplay` runs but writes invalid chunks);
-**P6** longer end-to-end parity vs the reference + perf (CPU nps is low; no GPU
-batching yet through the lc0 backend).
+`akshay-chessckers-0` builds, plays both sides via lc0's classic MCTS, GPU-batches
+eval, self-plays full games, and writes trainer-consumable chessckers training data.
+
+- **P0** rename ✓
+- **P1** board/move/position adapter over `cc::` ✓ (parity test: FEN/movegen/apply/terminal)
+- **P2** build green ✓ (lc0 fixed-policy neural TUs excluded; classic search)
+- **P3** NN variable-policy backend wrapping `cc::ChesskersNet` ✓ (eval parity test, real net)
+- **P4** search integration ✓ (chess + checkers sides, opening double-move)
+- **P5** self-play → `cc::chunk` (ccz1) training data ✓ (full 352-move game → valid
+  358-ply chunk, native move dicts, wdl/moves_left correct, trainer-readable)
+- **P6** perf: CPU-batched + Metal GPU trunk through the lc0 backend ✓ (nps ~3→~52)
+
+Outstanding (non-blocking): a full move-by-move rule-parity diff vs the reference
+over a shared game; optional WDL/MLH heads (currently q-only); GitHub push + repo
+rename (outward-facing).
 
 ### Build & run (macOS / Apple)
 ```
