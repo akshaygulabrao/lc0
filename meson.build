@@ -936,7 +936,7 @@ configure_file(output : 'default_backend.h',
 
 if get_option('lc0')
   files += common_files
-  executable('lc0', 'src/main.cc',
+  executable('akshay-chessckers-0', 'src/main.cc',
        files, include_directories: includes, dependencies: deps, install: true)
 endif
 

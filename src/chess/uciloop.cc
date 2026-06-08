@@ -278,8 +278,8 @@ void StringUciResponder::SendRawResponse(const std::string& response) {
 }
 
 void StringUciResponder::SendId() {
-  SendRawResponse("id name Lc0 v" + GetVersionStr());
-  SendRawResponse("id author The LCZero Authors.");
+  SendRawResponse("id name akshay-chessckers-0 v" + GetVersionStr());
+  SendRawResponse("id author Akshay Gulabrao (based on Lc0 by The LCZero Authors).");
 }
 
 void StringUciResponder::OutputBestMove(BestMoveInfo* info) {
