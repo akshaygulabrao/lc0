@@ -34,6 +34,7 @@
 #include <cstring>
 
 #include "chess/types.h"
+#include "chessckers/apply.hpp"  // cc::detect_status (Chessckers terminal rules)
 
 namespace lczero {
 
@@ -73,21 +74,14 @@ GameResult operator-(const GameResult& res) {
 }
 
 GameResult PositionHistory::ComputeGameResult() const {
-  const auto& board = Last().GetBoard();
-  auto legal_moves = board.GenerateLegalMoves();
-  if (legal_moves.empty()) {
-    if (board.IsUnderCheck()) {
-      // Checkmate.
-      return IsBlackToMove() ? GameResult::WHITE_WON : GameResult::BLACK_WON;
-    }
-    // Stalemate.
-    return GameResult::DRAW;
-  }
-
-  if (!board.HasMatingMaterial()) return GameResult::DRAW;
-  if (Last().GetRule50Ply() >= 100) return GameResult::DRAW;
-  if (Last().GetRepetitions() >= 2) return GameResult::DRAW;
-
+  // Chessckers terminals (cc::detect_status): Black eliminated / rank-8 hold ->
+  // White wins; White king captured / White has no moves while in check (mate) ->
+  // Black wins; White has no moves without check -> stalemate (draw); Black has no
+  // moves -> White wins. No 50-move / repetition / insufficient-material draws.
+  const cc::Status st = cc::detect_status(Last().GetBoard().cc());
+  if (st.winner == "white") return GameResult::WHITE_WON;
+  if (st.winner == "black") return GameResult::BLACK_WON;
+  if (st.status == "stalemate") return GameResult::DRAW;
   return GameResult::UNDECIDED;
 }
 

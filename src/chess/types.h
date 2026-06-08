@@ -28,8 +28,17 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+// Chessckers port: a Move carries a reference-engine native move (chains/deploys/
+// charges/waypoints don't fit lc0's old 16-bit packing). Forward-declared here so
+// the heavy cc:: core (movegen/nn/BLAS) is NOT pulled into every TU that includes
+// types.h; the cc-touching Move bodies live in chess/board.cc.
+namespace cc {
+struct NativeMove;
+}
 
 namespace lczero {
 
@@ -136,70 +145,36 @@ constexpr Square kSquareA1 = Square(kFileA, kRank1),
                  kSquareG1 = Square(kFileG, kRank1),
                  kSquareH1 = Square(kFileH, kRank1);
 
+// Chessckers move. Wraps a reference-engine cc::NativeMove (kept by shared_ptr so
+// copies into search edges are cheap while the heavy struct is shared). The cc::-
+// touching members are defined in chess/board.cc (cc::NativeMove is incomplete here).
+//
+// Gotcha #1 (see PORTING.md): Chessckers is asymmetric (White=chess, Black=checkers),
+// so there is NO valid board mirror. Flip() is therefore a deliberate no-op.
 class Move {
  public:
   Move() = default;
-  static constexpr Move White(Square from, Square to) {
-    return Move((from.as_idx() << 6) | to.as_idx());
-  }
-  static constexpr Move WhitePromotion(Square from, Square to,
-                                       PieceType promotion_piece) {
-    return Move((from.as_idx() << 6) | to.as_idx() | kPromotion |
-                (promotion_piece.idx << 12));
-  }
-  static constexpr Move WhiteCastling(File king, File rook) {
-    return Move((king.idx << 6) | rook.idx | kCastling);
-  }
-  static constexpr Move WhiteEnPassant(Square from, Square to) {
-    return Move((from.as_idx() << 6) | to.as_idx() | kEnPassant);
-  }
+  explicit Move(std::shared_ptr<const cc::NativeMove> nm) : nm_(std::move(nm)) {}
 
-  bool operator==(const Move& other) const = default;
-  bool operator!=(const Move& other) const = default;
+  // Compatibility shim: builds a white from/to move (only consumer is engine_test).
+  // The real construction path is ChessBoard::GenerateLegalMoves()/ParseMove().
+  static Move White(Square from, Square to);
 
-  // Mirrors the ranks of the move.
-  void Flip() { data_ ^= kFlipMask; }
-  std::string ToString(bool is_chess960) const;
+  bool operator==(const Move& other) const;
+  bool operator!=(const Move& other) const { return !(*this == other); }
 
-  Square from() const { return Square::FromIdx((data_ & kFromMask) >> 6); }
-  Square to() const { return Square::FromIdx(data_ & kToMask); }
-  bool is_promotion() const { return data_ & kPromotion; }
-  PieceType promotion() const {
-    return PieceType::FromIdx((data_ & kPieceMask) >> 12);
-  }
-  bool is_castling() const { return (data_ & kSpecialMask) == kCastling; }
-  bool is_en_passant() const { return (data_ & kSpecialMask) == kEnPassant; }
-  // TODO remove this once UciReponder starts using std::optional for ponder.
-  bool is_null() const { return data_ == 0; }
+  // No-op: asymmetric variant, moves are never mirrored. Kept for API parity.
+  void Flip() {}
+  std::string ToString(bool is_chess960 = false) const;
 
-  uint16_t raw_data() const { return data_; }
+  Square from() const;
+  Square to() const;
+  bool is_null() const { return !nm_; }
+
+  const std::shared_ptr<const cc::NativeMove>& native() const { return nm_; }
 
  private:
-  explicit constexpr Move(uint16_t data) : data_(data) {}
-
-  // Move encoding using 16 bits:
-  // - bits  0-5:  "to" square (6 bits)
-  // - bits  6-11: "from" square (6 bits)
-  // - bits  12-13: if is_promotion:  promotion piece type
-  //                if !is_promotion: SpecialMove
-  // - bit   14:   is_promotion flag
-  // - bit   15:   reserved (potentially for side-to-move)
-  // Castling is always encoded as a "king takes rook" move.
-  uint16_t data_ = 0;
-
-  enum Masks : uint16_t {
-    // clang-format off
-    kToMask      = 0b0000000000111111,
-    kFromMask    = 0b0000111111000000,
-    kSpecialMask = 0b0111000000000000,
-    kCastling    = 0b0001000000000000,
-    kEnPassant   = 0b0010000000000000,
-    kPromotion   = 0b0100000000000000,
-    kPieceMask   = 0b0011000000000000,
-    // If/when we have side-to-move bit, also flip it here.
-    kFlipMask    = 0b0000111000111000,
-    // clang-format on
-  };
+  std::shared_ptr<const cc::NativeMove> nm_;
 };
 
 inline int operator-(File a, File b) { return static_cast<int>(a.idx) - b.idx; }
@@ -226,18 +201,6 @@ inline PieceType PieceType::Parse(char c) {
     default:
       return PieceType{6};
   }
-}
-
-inline std::string Move::ToString(bool is_chess960) const {
-  if (is_castling() && !is_chess960 && from().file() == kFileE) {
-    if (to().file() == kFileA) {
-      return from().ToString() + "c" +  to().rank().ToString();
-    } else if (to().file() == kFileH) {
-      return from().ToString() + "g" +  to().rank().ToString();
-    }
-  }
-  return from().ToString() + to().ToString() +
-         (is_promotion() ? promotion().ToString(false) : "");
 }
 
 using MoveList = std::vector<Move>;

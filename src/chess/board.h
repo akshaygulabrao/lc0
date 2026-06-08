@@ -14,16 +14,17 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
+
+// Chessckers port: ChessBoard is an adapter over the reference engine's cc::Board
+// (10x10-path checkers-vs-chess hybrid). It keeps lc0's ChessBoard public API so
+// the generic search/uci/engine layers compile unchanged, but delegates rules to
+// the cc:: core (chess/board.cc). See PORTING.md.
+//
+// Gotcha #1: Chessckers is asymmetric -> NO board mirror. Mirror() is a no-op and
+// the board is ALWAYS in the absolute (White-frame) coordinates. flipped() means
+// "Black to move" without anything having been mirrored. ours()/theirs() are
+// therefore White/Black absolutely, not side-to-move-relative.
 
 #pragma once
 
@@ -32,14 +33,13 @@
 
 #include "chess/bitboard.h"
 #include "chess/types.h"
+#include "chessckers/board.hpp"  // cc::Board (lightweight: no BLAS/nn pulled in)
 #include "utils/hashcat.h"
 
 namespace lczero {
 
-// Initializes internal magic bitboard structures.
-void InitializeMagicBitboards();
-
-// Represents king attack info used during legal move detection.
+// Kept for API parity with lc0's legal-move detection. In Chessckers, legality is
+// fully resolved inside cc:: move generation, so the search never relies on this.
 class KingAttackInfo {
  public:
   bool in_check() const { return attack_lines_.as_int(); }
@@ -56,8 +56,7 @@ class KingAttackInfo {
   BitBoard attack_lines_ = {0};
 };
 
-// Represents a board position.
-// Unlike most chess engines, the board is mirrored for black.
+// Represents a Chessckers position (board + stacks + turn/win state).
 class ChessBoard {
  public:
   ChessBoard() = default;
@@ -70,191 +69,99 @@ class ChessBoard {
   static const ChessBoard kStartposBoard;
   static const BitBoard kPawnMask;
 
-  // Sets position from FEN string.
-  // If @rule50_ply and @moves are not nullptr, they are filled with number
-  // of moves without capture and number of full moves since the beginning of
-  // the game.
+  // Sets position from (extended) FEN. Fills rule50/move counters if requested.
   void SetFromFen(std::string_view fen, int* rule50_ply = nullptr,
                   int* moves = nullptr);
-  // Nullifies the whole structure.
   void Clear();
-  // Swaps black and white pieces and mirrors them relative to the
-  // middle of the board. (what was on rank 1 appears on rank 8, what was
-  // on file b remains on file b).
-  void Mirror();
+  // No-op in Chessckers (asymmetric variant; see gotcha #1). Kept for API parity.
+  void Mirror() {}
 
-  // Generates list of possible moves for "ours" (white), but may leave king
-  // under check.
-  MoveList GeneratePseudolegalMoves() const;
-  // Applies the move. (Only for "ours" (white)). Returns true if 50 moves
-  // counter should be removed.
-  bool ApplyMove(Move move);
-  // Checks if the square is under attack from "theirs" (black).
-  bool IsUnderAttack(Square square) const;
-  // Generates the king attack info used for legal move detection.
-  KingAttackInfo GenerateKingAttackInfo() const;
-  // Checks if "our" (white) king is under check.
-  bool IsUnderCheck() const { return IsUnderAttack(our_king_); }
-
-  // Checks whether at least one of the sides has mating material.
-  bool HasMatingMaterial() const;
-  // Generates legal moves.
+  // Generates legal moves (cc:: gen is already fully legal, so pseudolegal==legal).
+  MoveList GeneratePseudolegalMoves() const { return GenerateLegalMoves(); }
   MoveList GenerateLegalMoves() const;
-  // Check whether pseudolegal move is legal.
-  bool IsLegalMove(Move move, const KingAttackInfo& king_attack_info) const;
+  // Applies a (legal) move. Returns true if the rule50 counter should be reset.
+  bool ApplyMove(Move move);
+  // Whether White's king is in Chessckers-check (only meaningful when White to move).
+  bool IsUnderCheck() const;
+  // Chessckers has no insufficient-material draw.
+  bool HasMatingMaterial() const { return true; }
+  // cc:: moves are pre-validated, so every generated move is legal.
+  bool IsLegalMove(Move, const KingAttackInfo&) const { return true; }
+  KingAttackInfo GenerateKingAttackInfo() const { return {}; }
+  // Syzygy-only in lc0; unused in Chessckers (tablebases excluded). Best-effort.
+  bool IsUnderAttack(Square) const { return false; }
 
-  // Parses a move from move_str.
-  // The input string should be in the "normal" notation rather than from the
-  // player to move, i.e. "e7e5" for the black pawn move.
-  // Output is currently "from the player to move" perspective (i.e. from=E2,
-  // to=E4 for the same black move). This is temporary, plan is to change it
-  // soon.
+  // Resolves a UCI string to a legal Move (matches against generated moves).
   Move ParseMove(std::string_view move_str) const;
 
-  uint64_t Hash() const {
-    return HashCat({our_pieces_.as_int(), their_pieces_.as_int(),
-                    rooks_.as_int(), bishops_.as_int(), pawns_.as_int(),
-                    (static_cast<uint32_t>(our_king_.as_idx()) << 24) |
-                        (static_cast<uint32_t>(their_king_.as_idx()) << 16) |
-                        (static_cast<uint32_t>(castlings_.as_int()) << 8) |
-                        static_cast<uint32_t>(flipped_)});
-  }
+  uint64_t Hash() const;
 
+  // cc:: castling_rights uses python-chess rook-corner bits:
+  //   a1(Q)=bit0, h1(K)=bit7, a8(q)=bit56, h8(k)=bit63.
   class Castlings {
    public:
-    Castlings()
-        : our_queenside_rook(kFileA),
-          their_queenside_rook(kFileA),
-          our_kingside_rook(kFileH),
-          their_kingside_rook(kFileH),
-          data_(0) {}
-
-    void set_we_can_00() { data_ |= 1; }
-    void set_we_can_000() { data_ |= 2; }
-    void set_they_can_00() { data_ |= 4; }
-    void set_they_can_000() { data_ |= 8; }
-
-    void reset_we_can_00() { data_ &= ~1; }
-    void reset_we_can_000() { data_ &= ~2; }
-    void reset_they_can_00() { data_ &= ~4; }
-    void reset_they_can_000() { data_ &= ~8; }
+    Castlings() = default;
+    explicit Castlings(uint64_t cc_rights) {
+      if (cc_rights & (1ULL << 7)) data_ |= 1;    // White kingside  (K)
+      if (cc_rights & (1ULL << 0)) data_ |= 2;    // White queenside (Q)
+      if (cc_rights & (1ULL << 63)) data_ |= 4;   // Black kingside  (k)
+      if (cc_rights & (1ULL << 56)) data_ |= 8;   // Black queenside (q)
+    }
 
     bool we_can_00() const { return data_ & 1; }
     bool we_can_000() const { return data_ & 2; }
     bool they_can_00() const { return data_ & 4; }
     bool they_can_000() const { return data_ & 8; }
     bool no_legal_castle() const { return data_ == 0; }
-
-    void Mirror() {
-      std::swap(our_queenside_rook, their_queenside_rook);
-      std::swap(our_kingside_rook, their_kingside_rook);
-      data_ = ((data_ & 0b11) << 2) + ((data_ & 0b1100) >> 2);
-    }
-
-    // Note: this is not a strict xfen compatible output. Without access to the
-    // board its not possible to know whether there is ambiguity so all cases
-    // with any non-standard rook positions are encoded in the x-fen format
-    std::string as_string() const {
-      if (data_ == 0) return "-";
-      std::string result;
-      if (our_queenside_rook == kFileA && our_kingside_rook == kFileH &&
-          their_queenside_rook == kFileA && their_kingside_rook == kFileH) {
-        if (we_can_00()) result += 'K';
-        if (we_can_000()) result += 'Q';
-        if (they_can_00()) result += 'k';
-        if (they_can_000()) result += 'q';
-      } else {
-        if (we_can_00()) result += our_kingside_rook.ToString(true);
-        if (we_can_000()) result += our_queenside_rook.ToString(true);
-        if (they_can_00()) result += their_kingside_rook.ToString(false);
-        if (they_can_000()) result += their_queenside_rook.ToString(false);
-      }
-      return result;
-    }
-
-    std::string DebugString() const {
-      std::string result;
-      if (data_ == 0) result = "-";
-      if (we_can_00()) result += 'K';
-      if (we_can_000()) result += 'Q';
-      if (they_can_00()) result += 'k';
-      if (they_can_000()) result += 'q';
-      result += '[';
-      result += our_queenside_rook.ToString(true);
-      result += our_kingside_rook.ToString(true);
-      result += their_queenside_rook.ToString(false);
-      result += their_kingside_rook.ToString(false);
-      result += ']';
-      return result;
-    }
-
     uint8_t as_int() const { return data_; }
     bool operator==(const Castlings& other) const = default;
 
-    // Position of "left" (queenside) rook in starting game position.
-    File our_queenside_rook;
-    File their_queenside_rook;
-    // Position of "right" (kingside) rook in starting position.
-    File our_kingside_rook;
-    File their_kingside_rook;
+    std::string as_string() const {
+      if (data_ == 0) return "-";
+      std::string r;
+      if (we_can_00()) r += 'K';
+      if (we_can_000()) r += 'Q';
+      if (they_can_00()) r += 'k';
+      if (they_can_000()) r += 'q';
+      return r;
+    }
+    std::string DebugString() const { return as_string(); }
+
+    File our_queenside_rook{kFileA};
+    File their_queenside_rook{kFileA};
+    File our_kingside_rook{kFileH};
+    File their_kingside_rook{kFileH};
 
    private:
-    // - Bit 0 -- "our" side's kingside castle.
-    // - Bit 1 -- "our" side's queenside castle.
-    // - Bit 2 -- opponent's side's kingside castle.
-    // - Bit 3 -- opponent's side's queenside castle.
-    uint8_t data_;
+    uint8_t data_ = 0;
   };
 
   std::string DebugString() const;
 
-  BitBoard ours() const { return our_pieces_; }
-  BitBoard theirs() const { return their_pieces_; }
-  BitBoard pawns() const { return pawns_ & kPawnMask; }
-  BitBoard en_passant() const { return pawns_ - kPawnMask; }
-  BitBoard bishops() const { return bishops_ - rooks_; }
-  BitBoard rooks() const { return rooks_ - bishops_; }
-  BitBoard queens() const { return rooks_ & bishops_; }
-  BitBoard knights() const {
-    return (our_pieces_ | their_pieces_) - pawns() - our_king_ - their_king_ -
-           rooks_ - bishops_;
-  }
-  BitBoard kings() const {
-    return BitBoard::FromSquare(our_king_) | BitBoard::FromSquare(their_king_);
-  }
-  const Castlings& castlings() const { return castlings_; }
-  bool flipped() const { return flipped_; }
+  // Absolute-frame bitboard accessors (gotcha #1: ours=White, theirs=Black).
+  BitBoard ours() const { return BitBoard(b_.occupied_white); }
+  BitBoard theirs() const { return BitBoard(b_.occupied_black); }
+  BitBoard pawns() const { return BitBoard(b_.pawns); }
+  BitBoard en_passant() const { return BitBoard(0); }
+  BitBoard bishops() const { return BitBoard(b_.bishops); }
+  BitBoard rooks() const { return BitBoard(b_.rooks); }
+  BitBoard queens() const { return BitBoard(b_.queens); }
+  BitBoard knights() const { return BitBoard(b_.knights); }
+  BitBoard kings() const { return BitBoard(b_.kings); }
+  Castlings castlings() const { return Castlings(b_.castling_rights); }
+  bool flipped() const { return !b_.turn_white; }  // Black to move
 
-  bool operator==(const ChessBoard& other) const = default;
-  bool operator!=(const ChessBoard& other) const = default;
+  // Direct access to the backing cc:: state (used by chess/board.cc & the backend).
+  const cc::Board& cc() const { return b_; }
+  cc::Board& cc() { return b_; }
+
+  bool operator==(const ChessBoard& other) const;
+  bool operator!=(const ChessBoard& other) const { return !(*this == other); }
 
  private:
-  // Sets the piece on the square.
-  void PutPiece(Square square, PieceType piece, bool is_theirs);
-  // Check internal state is consistent after state transformations.
-  bool IsValid() const;
-
-  // All white pieces.
-  BitBoard our_pieces_;
-  // All black pieces.
-  BitBoard their_pieces_;
-  // Rooks and queens.
-  BitBoard rooks_;
-  // Bishops and queens;
-  BitBoard bishops_;
-  // Pawns.
-  // Ranks 1 and 8 have special meaning. Pawn at rank 1 means that
-  // corresponding white pawn on rank 4 can be taken en passant. Rank 8 is the
-  // same for black pawns. Those "fake" pawns are not present in our_pieces_ and
-  // their_pieces_ bitboards.
-  BitBoard pawns_;
-  Square our_king_;
-  Square their_king_;
-  Castlings castlings_;
-  bool flipped_ = false;  // aka "Black to move".
+  cc::Board b_;
 };
 
-// Converts the board to FEN string.
 std::string BoardToFen(const ChessBoard& board);
 
 }  // namespace lczero
