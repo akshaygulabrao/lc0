@@ -132,13 +132,17 @@ common_files += [
   'src/chess/uciloop.cc',
   'src/neural/backend.cc',
   'src/neural/batchsplit.cc',
-  'src/neural/decoder.cc',
-  'src/neural/encoder.cc',
+  # Chessckers: lc0's fixed-1858 chess encoder/decoder + the Network->Backend
+  # wrapper are replaced by src/neural/backends/chessckers_backend.cc.
+  #   'src/neural/decoder.cc',
+  #   'src/neural/encoder.cc',
+  #   'src/neural/wrapper.cc',
   'src/neural/factory.cc',
   'src/neural/loader.cc',
   'src/neural/register.cc',
   'src/neural/shared_params.cc',
-  'src/neural/wrapper.cc',
+  'src/neural/backends/chessckers_backend.cc',
+  'src/neural/encoder_chessckers_stub.cc',
   'src/search/classic/node.cc',
   'src/syzygy/syzygy.cc',
   'src/trainingdata/reader.cc',
@@ -159,22 +163,12 @@ common_files += [
 files += [
   'src/engine_loop.cc',
   'src/engine.cc',
-  'src/neural/backends/network_check.cc',
-  'src/neural/backends/network_demux.cc',
-  'src/neural/backends/network_mux.cc',
-  'src/neural/backends/network_random.cc',
-  'src/neural/backends/network_record.cc',
-  'src/neural/backends/network_rr.cc',
-  'src/neural/backends/network_trivial.cc',
+  # Chessckers: the legacy Network-wrapping backends, the proto LegacyWeights
+  # builder, and the ONNX/XLA converters all assume lc0's fixed-policy proto nets.
+  # The chessckers backend (cc:: .bin) replaces them. Excluded:
+  #   network_check/demux/mux/random/record/rr/trivial, network_legacy,
+  #   onnx/*, xla/*.
   'src/neural/memcache.cc',
-  'src/neural/network_legacy.cc',
-  'src/neural/onnx/adapters.cc',
-  'src/neural/onnx/builder.cc',
-  'src/neural/onnx/converter.cc',
-  'src/neural/xla/hlo_builder.cc',
-  'src/neural/xla/onnx2hlo.cc',
-  'src/neural/xla/print_hlo.cc',
-  'src/neural/xla/xla_tensor.cc',
   'src/search/classic/params.cc',
   'src/search/classic/search.cc',
   'src/search/classic/stoppers/alphazero.cc',
@@ -191,11 +185,9 @@ files += [
   'src/selfplay/loop.cc',
   'src/selfplay/multigame.cc',
   'src/selfplay/tournament.cc',
-  'src/tools/backendbench.cc',
   'src/tools/benchmark.cc',
-  'src/tools/describenet.cc',
-  'src/tools/leela2onnx.cc',
-  'src/tools/onnx2leela.cc',
+  # Chessckers: backendbench + describenet/leela2onnx/onnx2leela are proto/onnx
+  # tools, excluded (the cc:: net isn't an lc0 proto).
   'src/utils/histogram.cc',
   'src/utils/numa.cc',
   'src/utils/weights_adapter.cc',
@@ -209,6 +201,12 @@ includes += include_directories('src')
 # Chessckers variant+NN core (vendored from engine/cpp). Header-only; its headers
 # cross-reference each other by bare name (#include "board.hpp"), so expose the dir.
 includes += include_directories('src/chessckers')
+# The cc:: NN forward (nn.hpp) needs CBLAS (cblas_sgemm). This is independent of the
+# (now-disabled) lc0 `blas` backend option: link Accelerate on Apple unconditionally.
+if host_machine.system() == 'darwin'
+  deps += dependency('Accelerate')
+  add_project_arguments('-DACCELERATE_NEW_LAPACK', language: 'cpp')
+endif
 
 deps += dependency('absl_flat_hash_map', 'absl', modules:['absl::flat_hash_map'],
                    include_type: 'system',
