@@ -65,6 +65,33 @@ Move Move::White(Square from, Square to) {
   return Move(std::move(nm));
 }
 
+// Chess-only compat shims (pgn.h SAN parsing). Compile-only: the produced moves
+// are NOT valid Chessckers apply payloads and must not reach cc::apply_native.
+Move Move::WhitePromotion(Square from, Square to, PieceType promotion_piece) {
+  auto nm = std::make_shared<cc::NativeMove>();
+  nm->is_white = true;
+  nm->uci = from.ToString() + to.ToString() + promotion_piece.ToString(false);
+  nm->white_src.from_sq = from.as_idx();
+  nm->white_src.to_sq = to.as_idx();
+  return Move(std::move(nm));
+}
+Move Move::WhiteCastling(File king, File rook) {
+  auto nm = std::make_shared<cc::NativeMove>();
+  nm->is_white = true;
+  nm->uci = Square(king, kRank1).ToString() + Square(rook, kRank1).ToString();
+  nm->white_src.from_sq = Square(king, kRank1).as_idx();
+  nm->white_src.to_sq = Square(rook, kRank1).as_idx();
+  return Move(std::move(nm));
+}
+Move Move::WhiteEnPassant(Square from, Square to) {
+  auto nm = std::make_shared<cc::NativeMove>();
+  nm->is_white = true;
+  nm->uci = from.ToString() + to.ToString();
+  nm->white_src.from_sq = from.as_idx();
+  nm->white_src.to_sq = to.as_idx();
+  return Move(std::move(nm));
+}
+
 bool Move::operator==(const Move& other) const {
   if (!nm_ || !other.nm_) return nm_.get() == other.nm_.get();
   return nm_->uci == other.nm_->uci &&

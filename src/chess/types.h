@@ -156,9 +156,15 @@ class Move {
   Move() = default;
   explicit Move(std::shared_ptr<const cc::NativeMove> nm) : nm_(std::move(nm)) {}
 
-  // Compatibility shim: builds a white from/to move (only consumer is engine_test).
-  // The real construction path is ChessBoard::GenerateLegalMoves()/ParseMove().
+  // Compatibility shims for chess-only code (PGN/SAN book parsing in pgn.h,
+  // engine_test). NOT used by the Chessckers runtime — the real construction path
+  // is ChessBoard::GenerateLegalMoves()/ParseMove(). These just build a uci+squares
+  // NativeMove so that chess-only TUs compile; the resulting moves are not valid
+  // Chessckers apply payloads and must not reach cc::apply_native.
   static Move White(Square from, Square to);
+  static Move WhitePromotion(Square from, Square to, PieceType promotion_piece);
+  static Move WhiteCastling(File king, File rook);
+  static Move WhiteEnPassant(Square from, Square to);
 
   bool operator==(const Move& other) const;
   bool operator!=(const Move& other) const { return !(*this == other); }

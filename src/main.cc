@@ -87,7 +87,7 @@ int main(int argc, const char** argv) {
        << " built " << __DATE__;
 
   try {
-    InitializeMagicBitboards();
+    // Chessckers: no magic bitboards (the cc:: core uses simple bitboard ops).
 
     CommandLine::Init(argc, argv);
     if (CommandLine::BinaryName().find("simple") == std::string::npos) {

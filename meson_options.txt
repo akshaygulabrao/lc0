@@ -262,8 +262,10 @@ option('default_backend',
 
 option('dag_classic',
        type: 'boolean',
-       value: true,
-       description: 'Enable dag-classic search algorithm')
+       value: false,
+       description: 'Enable dag-classic search algorithm (Chessckers port: off by '
+                  + 'default; classic is ported first. dag_classic embeds Move in '
+                  + 'Node, which exceeds the 64B assert with the heavier cc:: Move.)')
 
 option('nvcc',
        type: 'boolean',
