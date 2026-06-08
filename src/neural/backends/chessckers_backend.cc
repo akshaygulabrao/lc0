@@ -11,33 +11,117 @@
   to legal_moves by index. We:
     - encode the current board with cc::encode_position[_v2] (16ch/10x10 for V2),
     - encode each legal move's features with cc::encode_native_move,
-    - run cc::ChesskersNet::eval -> (value, softmaxed priors),
+    - run a BATCHED forward (cc::ChesskersNet::eval_batch on CPU BLAS, or
+      cc::MetalTrunkV2::eval_batch on the GPU when built/available): one fused trunk
+      pass over the whole minibatch + per-board value/policy heads,
     - write q=value (side-to-move WDL scalar, [-1,1]) and p[i]=priors[i].
   has_wdl/has_mlh are false for first parity (q only; no separate draw/MLH heads).
+
+  Batching is the lc0 GPU play: the search gathers a minibatch (recommended_batch_
+  size below), AddInput is called per leaf, then ComputeBlocking() runs ONE batched
+  forward. On Apple with CC_HAVE_METAL the trunk runs on the GPU (~10x/board).
 */
 
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "chess/board.h"
 #include "chess/position.h"
-#include "chessckers/lc0_eval.hpp"
+#include "chessckers/encode.hpp"
+#include "chessckers/native_move.hpp"
 #include "chessckers/nn.hpp"
 #include "neural/backend.h"
 #include "neural/register.h"
 #include "neural/shared_params.h"
-#include "utils/exception.h"
 #include "utils/logging.h"
+
+#ifdef CC_HAVE_METAL
+#include "chessckers/nn_metal.h"
+#endif
 
 namespace lczero {
 namespace {
 
-class ChesskersBackend;
+using EvalBatchResult = std::vector<std::pair<float, std::vector<float>>>;
+
+class ChesskersBackend : public Backend {
+ public:
+  explicit ChesskersBackend(const OptionsDict& options)
+      : net_(options.Get<std::string>(SharedBackendParams::kWeightsId)) {
+#ifdef CC_HAVE_METAL
+    if (net_.is_v2) {
+      auto metal = std::make_unique<cc::MetalTrunkV2>(net_);
+      if (metal->ok()) {
+        metal_ = std::move(metal);
+        CERR << "Chessckers backend: Metal GPU trunk enabled (is_v2="
+             << net_.is_v2 << ").";
+      }
+    }
+#endif
+    if (!metal_enabled()) {
+      CERR << "Chessckers backend: CPU BLAS forward (is_v2=" << net_.is_v2
+           << ").";
+    }
+  }
+
+  BackendAttributes GetAttributes() const override {
+    return BackendAttributes{
+        .has_mlh = false,
+        .has_wdl = false,
+        .runs_on_cpu = !metal_enabled(),
+        .suggested_num_search_threads = 2,
+        // Encourage the search to gather a real minibatch so the batched/GPU
+        // trunk pays off (the conv GEMMs fuse across the batch).
+        .recommended_batch_size = 256,
+        .maximum_batch_size = 1024,
+    };
+  }
+
+  std::unique_ptr<BackendComputation> CreateComputation() override;
+
+  bool metal_enabled() const {
+#ifdef CC_HAVE_METAL
+    return metal_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  const cc::ChesskersNet& net() const { return net_; }
+
+  // One fused batched forward over the whole minibatch.
+  EvalBatchResult EvalBatch(
+      const std::vector<std::vector<float>>& positions,
+      const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+#ifdef CC_HAVE_METAL
+    if (metal_) {
+      // The MPSGraph / Metal command queue is single-threaded: serialize GPU
+      // submissions across search threads (the reference funnels all forwards
+      // through one gatherer for the same reason). The minibatch is the
+      // parallelism; the CPU value/gather heads inside eval_batch are per-board.
+      std::lock_guard<std::mutex> lk(metal_mu_);
+      return metal_->eval_batch(positions, moves_per);
+    }
+#endif
+    // CPU BLAS forward is const + re-entrant: safe to call from many threads.
+    return net_.eval_batch(positions, moves_per);
+  }
+
+ private:
+  cc::ChesskersNet net_;
+#ifdef CC_HAVE_METAL
+  std::unique_ptr<cc::MetalTrunkV2> metal_;
+  mutable std::mutex metal_mu_;
+#endif
+};
 
 class ChesskersComputation : public BackendComputation {
  public:
-  explicit ChesskersComputation(const cc::ChesskersNet& net) : net_(net) {}
+  explicit ChesskersComputation(const ChesskersBackend& backend)
+      : backend_(backend) {}
 
   size_t UsedBatchSize() const override { return items_.size(); }
 
@@ -53,13 +137,36 @@ class ChesskersComputation : public BackendComputation {
   }
 
   void ComputeBlocking() override {
-    for (auto& item : items_) {
-      auto [value, priors] = EvalChessckers(net_, item.board, item.moves);
-      if (item.out.q) *item.out.q = value;
-      if (item.out.d) *item.out.d = 0.0f;  // has_wdl=false: no separate draw head
-      if (item.out.m) *item.out.m = 0.0f;  // has_mlh=false
-      const size_t n = std::min(priors.size(), item.out.p.size());
-      for (size_t i = 0; i < n; ++i) item.out.p[i] = priors[i];
+    const size_t k = items_.size();
+    if (k == 0) return;
+    const cc::ChesskersNet& net = backend_.net();
+
+    std::vector<std::vector<float>> positions;
+    std::vector<std::vector<std::vector<float>>> moves_per;
+    positions.reserve(k);
+    moves_per.reserve(k);
+    for (const auto& item : items_) {
+      positions.push_back(net.is_v2 ? cc::encode_position_v2(item.board.cc())
+                                    : cc::encode_position(item.board.cc()));
+      std::vector<std::vector<float>> menc;
+      menc.reserve(item.moves.size());
+      for (const auto& m : item.moves) {
+        menc.push_back(cc::encode_native_move(net, *m.native()));
+      }
+      moves_per.push_back(std::move(menc));
+    }
+
+    const EvalBatchResult results = backend_.EvalBatch(positions, moves_per);
+
+    for (size_t i = 0; i < k; ++i) {
+      const float value = results[i].first;
+      const std::vector<float>& priors = results[i].second;
+      EvalResultPtr& out = items_[i].out;
+      if (out.q) *out.q = value;
+      if (out.d) *out.d = 0.0f;  // has_wdl=false
+      if (out.m) *out.m = 0.0f;  // has_mlh=false
+      const size_t n = std::min(priors.size(), out.p.size());
+      for (size_t j = 0; j < n; ++j) out.p[j] = priors[j];
     }
     items_.clear();
   }
@@ -70,35 +177,13 @@ class ChesskersComputation : public BackendComputation {
     MoveList moves;
     EvalResultPtr out;
   };
-  const cc::ChesskersNet& net_;
+  const ChesskersBackend& backend_;
   std::vector<Item> items_;
 };
 
-class ChesskersBackend : public Backend {
- public:
-  explicit ChesskersBackend(const OptionsDict& options)
-      : net_(options.Get<std::string>(SharedBackendParams::kWeightsId)) {
-    CERR << "Chessckers backend loaded net (is_v2=" << net_.is_v2 << ").";
-  }
-
-  BackendAttributes GetAttributes() const override {
-    return BackendAttributes{
-        .has_mlh = false,
-        .has_wdl = false,
-        .runs_on_cpu = true,
-        .suggested_num_search_threads = 2,
-        .recommended_batch_size = 1,
-        .maximum_batch_size = 1024,
-    };
-  }
-
-  std::unique_ptr<BackendComputation> CreateComputation() override {
-    return std::make_unique<ChesskersComputation>(net_);
-  }
-
- private:
-  cc::ChesskersNet net_;
-};
+std::unique_ptr<BackendComputation> ChesskersBackend::CreateComputation() {
+  return std::make_unique<ChesskersComputation>(*this);
+}
 
 class ChesskersBackendFactory : public BackendFactory {
  public:

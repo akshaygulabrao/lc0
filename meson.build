@@ -206,6 +206,20 @@ includes += include_directories('src/chessckers')
 if host_machine.system() == 'darwin'
   deps += dependency('Accelerate')
   add_project_arguments('-DACCELERATE_NEW_LAPACK', language: 'cpp')
+
+  # Chessckers GPU trunk: cc::MetalTrunkV2 (nn_metal.mm, MPSGraph). Independent of
+  # lc0's (disabled) `metal` backend option. ObjC++; defines CC_HAVE_METAL so the
+  # chessckers backend uses the GPU eval_batch path. No -fobjc-arc (matches the cc
+  # reference build, which manages Metal object lifetimes manually).
+  cc_metal_frameworks = dependency('appleframeworks',
+      modules : ['Foundation', 'Metal', 'MetalPerformanceShaders', 'MetalPerformanceShadersGraph'],
+      required: false)
+  if cc_metal_frameworks.found() and add_languages('objcpp', native: false, required: false)
+    deps += cc_metal_frameworks
+    common_files += 'src/chessckers/nn_metal.mm'
+    add_project_arguments('-DCC_HAVE_METAL', language: ['cpp', 'objcpp'])
+    add_project_arguments('-DACCELERATE_NEW_LAPACK', language: 'objcpp')
+  endif
 endif
 
 deps += dependency('absl_flat_hash_map', 'absl', modules:['absl::flat_hash_map'],
