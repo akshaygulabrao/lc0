@@ -8,6 +8,7 @@
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -366,7 +367,9 @@ MetalTrunkV2::MetalTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>(
             MPSGraphTensor* logit = [gh additionWithPrimaryTensor:dot secondaryTensor:ctx name:nil];  // [M,1,1]
             p_->hlogits = [gh reshapeTensor:logit withShape:@[ @(-1) ] name:nil];  // [M]
 
-            p_->heads_ok = true;
+            // CC_CPU_HEADS=1 forces the CPU value/gather heads (the pre-GPU-heads path) — for
+            // A/B benchmarking and as an escape hatch if a GPU-head issue ever surfaces.
+            p_->heads_ok = (std::getenv("CC_CPU_HEADS") == nullptr);
         }
     }
 }

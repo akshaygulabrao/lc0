@@ -6,10 +6,11 @@
 // the batching win, exactly like conv3x3_batch); groupnorm/relu/posemb/residual are small
 // custom kernels. Compiled only when CC_HAVE_CUDA is defined (nvcc + cublas + cudart present).
 //
-// Scope: pure-ResNet V2 trunks (stem + pos-emb + residual blocks) — the deployed nets
-// (trainer --tf-blocks=0). If the trunk contains a transformer block, ok()==false and the
-// chessckers backend falls back to the CPU forward (the same escape hatch as Metal's
-// "unsupported block"). The value/gather heads always run on the CPU (Phase 6e seam).
+// Supports V2 trunks including TransformerBlock2d (transformer blocks run on the GPU too). The
+// value + policy(gather) heads also run on the GPU now: eval_batch keeps F device-resident and
+// runs the heads via cuBLAS linears + gather/path-mean/dot kernels, with only the per-board
+// softmaxes on the host. The CPU forward (nn.hpp) stays the parity oracle; if a block is
+// unsupported, ok()==false and the chessckers backend falls back to the CPU forward.
 #pragma once
 
 #include <memory>
@@ -43,7 +44,21 @@ class CudaTrunkV2 {
         const std::vector<std::vector<float>>& positions,
         const std::vector<std::vector<std::vector<float>>>& moves_per) const;
 
+    // Run only the value/policy heads on already-computed trunk features Fs (K maps of
+    // [c_filters*100]); the back half of eval_batch, exposed so a parity harness can feed the
+    // SAME F here and to the CPU oracle (value_v2/policy_logits_v2), isolating the head port.
+    std::vector<std::pair<float, std::vector<float>>> eval_heads_from_F(
+        const std::vector<std::vector<float>>& Fs,
+        const std::vector<std::vector<std::vector<float>>>& moves_per) const;
+
   private:
+    // GPU trunk for K boards, leaving the K feature maps in the device scratch; returns K (0 if
+    // not ok / empty). Shared by run() (then downloads) and eval_batch (runs heads on-device).
+    int run_device(const std::vector<std::vector<float>>& positions) const;
+    // Value + policy heads on the K feature maps already in the device scratch.
+    std::vector<std::pair<float, std::vector<float>>> eval_heads_device(
+        int K, const std::vector<std::vector<std::vector<float>>>& moves_per) const;
+
     struct Impl;
     std::unique_ptr<Impl> p_;
 };

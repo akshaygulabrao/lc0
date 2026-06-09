@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -255,6 +256,89 @@ __global__ void scatter_oh_kernel(const float* __restrict__ Oh, float* __restric
     attn[(long)(base + s) * C + off + d] = Oh[idx];
 }
 
+// ---- head kernels (value + policy gather heads on the GPU) -----------------
+
+// Global mean-pool F[K][C*HW] over the 100 squares -> pooled[K,C] (double accum, /HW),
+// matching value_v2's pool. One thread per (board, channel).
+__global__ void pool_mean_kernel(const float* __restrict__ F, float* __restrict__ pooled, int K,
+                                 int C) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // k*C + c
+    if (idx >= (long)K * C) return;
+    const int k = (int)(idx / C), c = (int)(idx % C);
+    const float* base = F + (long)k * C * HW + (long)c * HW;
+    double s = 0.0;
+    for (int j = 0; j < HW; ++j) s += (double)base[j];
+    pooled[idx] = (float)(s / HW);
+}
+
+// Gather FF[i,c]=F[board[i]][c][from[i]] and TF[i,c]=F[...][to[i]] (policy_logits_v2 gather).
+__global__ void gather_endpoints_kernel(const float* __restrict__ F, const int* __restrict__ board,
+                                        const int* __restrict__ from, const int* __restrict__ to,
+                                        float* __restrict__ FF, float* __restrict__ TF, int M,
+                                        int C) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // i*C + c
+    if (idx >= (long)M * C) return;
+    const int i = (int)(idx / C), c = (int)(idx % C);
+    const long fbase = (long)board[i] * C * HW + (long)c * HW;
+    FF[idx] = F[fbase + from[i]];
+    TF[idx] = F[fbase + to[i]];
+}
+
+// Path-mean PF[i,c] = (sum_j mask[i,j]*F[board[i]][c][j]) / denom[i] (double accum, skip 0s).
+__global__ void path_mean_kernel(const float* __restrict__ F, const int* __restrict__ board,
+                                 const float* __restrict__ mask, const float* __restrict__ denom,
+                                 float* __restrict__ PF, int M, int C) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // i*C + c
+    if (idx >= (long)M * C) return;
+    const int i = (int)(idx / C), c = (int)(idx % C);
+    const float* fb = F + (long)board[i] * C * HW + (long)c * HW;
+    const float* mk = mask + (long)i * HW;
+    double s = 0.0;
+    for (int j = 0; j < HW; ++j) {
+        const float pj = mk[j];
+        if (pj != 0.0f) s += (double)pj * (double)fb[j];
+    }
+    PF[idx] = (float)(s / (double)denom[i]);
+}
+
+// Pack ctx_in[i] = [FF[i] | TF[i] | PF[i] | typ[i]] (3C+ntyp), matching policy_logits_v2.
+__global__ void assemble_ctx_kernel(const float* __restrict__ FF, const float* __restrict__ TF,
+                                    const float* __restrict__ PF, const float* __restrict__ typ,
+                                    float* __restrict__ ctx, int M, int C, int ntyp) {
+    const int cin = 3 * C + ntyp;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // i*cin + j
+    if (idx >= (long)M * cin) return;
+    const int i = (int)(idx / cin), j = (int)(idx % cin);
+    float v;
+    if (j < C) v = FF[(long)i * C + j];
+    else if (j < 2 * C) v = TF[(long)i * C + (j - C)];
+    else if (j < 3 * C) v = PF[(long)i * C + (j - 2 * C)];
+    else v = typ[(long)i * ntyp + (j - 3 * C)];
+    ctx[idx] = v;
+}
+
+// logit[i] = dot(src[i],tgt[i])/scale + ctx[i] (double-accumulated dot, matching policy_logits_v2).
+__global__ void rowdot_kernel(const float* __restrict__ src, const float* __restrict__ tgt,
+                              const float* __restrict__ ctx, float* __restrict__ logit, int M,
+                              int dh, float scale) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M) return;
+    const float* sp = src + (long)i * dh;
+    const float* tp = tgt + (long)i * dh;
+    double d = 0.0;
+    for (int j = 0; j < dh; ++j) d += (double)sp[j] * (double)tp[j];
+    logit[i] = (float)(d / (double)scale) + ctx[i];
+}
+
+// Y[R,out] = X[R,in] @ W[out,in]^T + bias (W row-major [out,in]); mirrors linear_batch.
+// Hoisted from run()'s tf lambda so the value/policy heads share it (R = K or M).
+inline void lin_gemm(cublasHandle_t handle, const float* Wd, const float* bd, const float* X,
+                     float* Y, int out, int in_, int R) {
+    const float one = 1.0f, zero = 0.0f;
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out, R, in_, &one, Wd, in_, X, in_, &zero, Y, out);
+    add_bias_kernel<<<ceil_div((long)R * out, TPB), TPB>>>(Y, bd, R, out);
+}
+
 // ---- device buffers ------------------------------------------------------
 
 struct DBuf {
@@ -267,6 +351,21 @@ struct DBuf {
         cap = n;
     }
     ~DBuf() {
+        if (p) cudaFree(p);
+    }
+};
+
+// Int device buffer (grow-on-demand), for the policy head's gather indices.
+struct IBuf {
+    int* p = nullptr;
+    size_t cap = 0;
+    void ensure(size_t n) {
+        if (n <= cap) return;
+        if (p) cudaFree(p);
+        cuda_check(cudaMalloc(&p, n * sizeof(int)), "cudaMalloc iscratch");
+        cap = n;
+    }
+    ~IBuf() {
         if (p) cudaFree(p);
     }
 };
@@ -325,6 +424,23 @@ struct CudaTrunkV2::Impl {
     mutable DBuf d_in, d_col, d_gemm, d_x, d_c1, d_c2;
     // transformer-block scratch (only grown for nets that actually have tf blocks)
     mutable DBuf d_t, d_tn, d_tn2, d_qkv, d_h1, d_q, d_k, d_v, d_sc, d_oh;
+
+    // ---- value + policy heads on the GPU (V2) ----
+    bool heads_ok = false;
+    int d_hidden = 256, d_move = 114;
+    float* vt0_w = nullptr; float* vt0_b = nullptr;  // value_trunk.0
+    float* vt1_g = nullptr; float* vt1_b = nullptr;  // value_trunk.1 (LN)
+    float* vh0_w = nullptr; float* vh0_b = nullptr;  // value_head.0
+    float* vh1_g = nullptr; float* vh1_b = nullptr;  // value_head.1 (LN)
+    float* vh3_w = nullptr; float* vh3_b = nullptr;  // value_head.3
+    float* src_w = nullptr; float* src_b = nullptr;  // src_proj
+    float* tgt_w = nullptr; float* tgt_b = nullptr;  // tgt_proj
+    float* cm0_w = nullptr; float* cm0_b = nullptr;  // ctx_mlp.0
+    float* cm1_g = nullptr; float* cm1_b = nullptr;  // ctx_mlp.1 (LN)
+    float* cm3_w = nullptr; float* cm3_b = nullptr;  // ctx_mlp.3
+    mutable DBuf d_pool, d_vt, d_v1, d_wdl;
+    mutable DBuf d_FF, d_TF, d_PF, d_pmask, d_denom, d_typ, d_src, d_tgt, d_ctxin, d_hid, d_ctx, d_logit;
+    mutable IBuf i_from, i_to, i_board;
 
     float* track(float* p) {
         owned.push_back(p);
@@ -392,6 +508,34 @@ CudaTrunkV2::CudaTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>())
                 break;  // end of trunk
             }
         }
+        // value + policy head weights (V2) — uploaded once; the heads then run on the GPU.
+        if (net.is_v2) {
+            p_->d_hidden = net.d_hidden;
+            p_->d_move = net.d_move;
+            p_->vt0_w = p_->track(upload(w.at("value_trunk.0.weight")));
+            p_->vt0_b = p_->track(upload(w.at("value_trunk.0.bias")));
+            p_->vt1_g = p_->track(upload(w.at("value_trunk.1.weight")));
+            p_->vt1_b = p_->track(upload(w.at("value_trunk.1.bias")));
+            p_->vh0_w = p_->track(upload(w.at("value_head.0.weight")));
+            p_->vh0_b = p_->track(upload(w.at("value_head.0.bias")));
+            p_->vh1_g = p_->track(upload(w.at("value_head.1.weight")));
+            p_->vh1_b = p_->track(upload(w.at("value_head.1.bias")));
+            p_->vh3_w = p_->track(upload(w.at("value_head.3.weight")));
+            p_->vh3_b = p_->track(upload(w.at("value_head.3.bias")));
+            p_->src_w = p_->track(upload(w.at("src_proj.weight")));
+            p_->src_b = p_->track(upload(w.at("src_proj.bias")));
+            p_->tgt_w = p_->track(upload(w.at("tgt_proj.weight")));
+            p_->tgt_b = p_->track(upload(w.at("tgt_proj.bias")));
+            p_->cm0_w = p_->track(upload(w.at("ctx_mlp.0.weight")));
+            p_->cm0_b = p_->track(upload(w.at("ctx_mlp.0.bias")));
+            p_->cm1_g = p_->track(upload(w.at("ctx_mlp.1.weight")));
+            p_->cm1_b = p_->track(upload(w.at("ctx_mlp.1.bias")));
+            p_->cm3_w = p_->track(upload(w.at("ctx_mlp.3.weight")));
+            p_->cm3_b = p_->track(upload(w.at("ctx_mlp.3.bias")));
+            // CC_CPU_HEADS=1 forces the CPU value/gather heads (the pre-GPU-heads path) — for
+            // A/B benchmarking and as an escape hatch if a GPU-head issue ever surfaces.
+            p_->heads_ok = (std::getenv("CC_CPU_HEADS") == nullptr);
+        }
         p_->ok = true;
     } catch (const std::exception&) {
         p_->ok = false;  // any upload failure -> fall back to CPU
@@ -402,11 +546,9 @@ CudaTrunkV2::~CudaTrunkV2() = default;
 
 bool CudaTrunkV2::ok() const { return p_ && p_->ok; }
 
-std::vector<std::vector<float>> CudaTrunkV2::run(
-    const std::vector<std::vector<float>>& positions) const {
-    std::vector<std::vector<float>> result;
+int CudaTrunkV2::run_device(const std::vector<std::vector<float>>& positions) const {
     const int K = (int)positions.size();
-    if (!p_->ok || K == 0) return result;
+    if (!p_->ok || K == 0) return 0;
 
     cuda_check(cudaSetDevice(0), "cudaSetDevice");
     const int C = p_->C, Cin = p_->c_in, COLS = K * HW;
@@ -470,9 +612,7 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
         // Y[R,out] = X[R,in] @ W[out,in]^T + bias (W row-major [out,in]); mirrors linear_batch.
         // Row-major-via-column-major: same mapping the conv lambda uses, with W transposed.
         auto lin = [&](const float* Wd, const float* bd, const float* X, float* Y, int out, int in_) {
-            cublasSgemm(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, out, R, in_, &one, Wd, in_, X, in_, &zero,
-                        Y, out);
-            add_bias_kernel<<<ceil_div((long)R * out, TPB), TPB>>>(Y, bd, R, out);
+            lin_gemm(s.handle, Wd, bd, X, Y, out, in_, R);
         };
         // t = token-major(x); n = LayerNorm1(t)
         chan_to_token_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_x.p, s.d_t.p, K, C, HW);
@@ -534,15 +674,116 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
         }
     }
 
-    // download K feature maps [C*HW] (the blocking memcpy also waits on all prior kernels).
+    cuda_check(cudaGetLastError(), "trunk kernel launch");
+    return K;  // K feature maps left in s.d_x.p (board-major [K][C*HW])
+}
+
+// Public run(): GPU trunk, then download the K feature maps to host.
+std::vector<std::vector<float>> CudaTrunkV2::run(
+    const std::vector<std::vector<float>>& positions) const {
+    std::vector<std::vector<float>> result;
+    const int K = run_device(positions);
+    if (K == 0) return result;
+    const int C = p_->C;
+    const long NX = (long)K * C * HW;
     std::vector<float> outf((size_t)NX);
-    cuda_check(cudaMemcpy(outf.data(), s.d_x.p, NX * sizeof(float), cudaMemcpyDeviceToHost),
+    cuda_check(cudaMemcpy(outf.data(), p_->d_x.p, NX * sizeof(float), cudaMemcpyDeviceToHost),
                "cudaMemcpy result");
-    cuda_check(cudaGetLastError(), "kernel launch");
     result.resize(K);
     for (int k = 0; k < K; ++k)
         result[k].assign(&outf[(size_t)k * C * HW], &outf[(size_t)(k + 1) * C * HW]);
     return result;
+}
+
+// Run the value + policy heads on the K feature maps already in s.d_x.p (left by run_device or
+// uploaded by eval_heads_from_F). Mirrors value_v2/policy_logits_v2 op-for-op; only the
+// per-board softmaxes run on the host (softmax_priors). Returns K (value, priors).
+std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_heads_device(
+    int K, const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+    std::vector<std::pair<float, std::vector<float>>> out(K);
+    Impl& s = *p_;
+    const int C = s.C, dh = s.d_hidden;
+
+    // value head: pool -> value_trunk.0 -> LN -> relu -> value_head.0 -> LN -> relu -> value_head.3
+    s.d_pool.ensure((size_t)K * C);
+    s.d_vt.ensure((size_t)K * dh);
+    s.d_v1.ensure((size_t)K * (dh / 2));
+    s.d_wdl.ensure((size_t)K * 3);
+    pool_mean_kernel<<<ceil_div((long)K * C, TPB), TPB>>>(s.d_x.p, s.d_pool.p, K, C);
+    lin_gemm(s.handle, s.vt0_w, s.vt0_b, s.d_pool.p, s.d_vt.p, dh, C, K);
+    layernorm_rows_kernel<<<ceil_div(K, TPB), TPB>>>(s.d_vt.p, K, dh, s.vt1_g, s.vt1_b, 1e-5f);
+    relu_kernel<<<ceil_div((long)K * dh, TPB), TPB>>>(s.d_vt.p, (long)K * dh);
+    lin_gemm(s.handle, s.vh0_w, s.vh0_b, s.d_vt.p, s.d_v1.p, dh / 2, dh, K);
+    layernorm_rows_kernel<<<ceil_div(K, TPB), TPB>>>(s.d_v1.p, K, dh / 2, s.vh1_g, s.vh1_b, 1e-5f);
+    relu_kernel<<<ceil_div((long)K * (dh / 2), TPB), TPB>>>(s.d_v1.p, (long)K * (dh / 2));
+    lin_gemm(s.handle, s.vh3_w, s.vh3_b, s.d_v1.p, s.d_wdl.p, 3, dh / 2, K);
+    std::vector<float> wdl((size_t)K * 3);
+    cuda_check(cudaMemcpy(wdl.data(), s.d_wdl.p, (size_t)K * 3 * sizeof(float),
+                          cudaMemcpyDeviceToHost), "wdl download");
+
+    // policy head: flattened over the M moves of all boards
+    const FlatMoves fm = flatten_moves(moves_per, s.d_move);
+    const int M = fm.M, ntyp = fm.n_typ;
+    std::vector<float> logits;
+    if (M > 0) {
+        const int cin = 3 * C + ntyp;
+        s.d_FF.ensure((size_t)M * C); s.d_TF.ensure((size_t)M * C); s.d_PF.ensure((size_t)M * C);
+        s.d_pmask.ensure((size_t)M * HW); s.d_denom.ensure((size_t)M); s.d_typ.ensure((size_t)M * ntyp);
+        s.d_src.ensure((size_t)M * dh); s.d_tgt.ensure((size_t)M * dh);
+        s.d_ctxin.ensure((size_t)M * cin); s.d_hid.ensure((size_t)M * dh);
+        s.d_ctx.ensure((size_t)M); s.d_logit.ensure((size_t)M);
+        s.i_from.ensure((size_t)M); s.i_to.ensure((size_t)M); s.i_board.ensure((size_t)M);
+        cuda_check(cudaMemcpy(s.i_from.p, fm.from_idx.data(), (size_t)M * sizeof(int), cudaMemcpyHostToDevice), "from up");
+        cuda_check(cudaMemcpy(s.i_to.p, fm.to_idx.data(), (size_t)M * sizeof(int), cudaMemcpyHostToDevice), "to up");
+        cuda_check(cudaMemcpy(s.i_board.p, fm.board_of.data(), (size_t)M * sizeof(int), cudaMemcpyHostToDevice), "board up");
+        cuda_check(cudaMemcpy(s.d_pmask.p, fm.pathmask.data(), (size_t)M * HW * sizeof(float), cudaMemcpyHostToDevice), "pmask up");
+        cuda_check(cudaMemcpy(s.d_denom.p, fm.denom.data(), (size_t)M * sizeof(float), cudaMemcpyHostToDevice), "denom up");
+        cuda_check(cudaMemcpy(s.d_typ.p, fm.typ.data(), (size_t)M * ntyp * sizeof(float), cudaMemcpyHostToDevice), "typ up");
+        gather_endpoints_kernel<<<ceil_div((long)M * C, TPB), TPB>>>(s.d_x.p, s.i_board.p, s.i_from.p, s.i_to.p, s.d_FF.p, s.d_TF.p, M, C);
+        path_mean_kernel<<<ceil_div((long)M * C, TPB), TPB>>>(s.d_x.p, s.i_board.p, s.d_pmask.p, s.d_denom.p, s.d_PF.p, M, C);
+        lin_gemm(s.handle, s.src_w, s.src_b, s.d_FF.p, s.d_src.p, dh, C, M);
+        lin_gemm(s.handle, s.tgt_w, s.tgt_b, s.d_TF.p, s.d_tgt.p, dh, C, M);
+        assemble_ctx_kernel<<<ceil_div((long)M * cin, TPB), TPB>>>(s.d_FF.p, s.d_TF.p, s.d_PF.p, s.d_typ.p, s.d_ctxin.p, M, C, ntyp);
+        lin_gemm(s.handle, s.cm0_w, s.cm0_b, s.d_ctxin.p, s.d_hid.p, dh, cin, M);
+        layernorm_rows_kernel<<<ceil_div(M, TPB), TPB>>>(s.d_hid.p, M, dh, s.cm1_g, s.cm1_b, 1e-5f);
+        relu_kernel<<<ceil_div((long)M * dh, TPB), TPB>>>(s.d_hid.p, (long)M * dh);
+        lin_gemm(s.handle, s.cm3_w, s.cm3_b, s.d_hid.p, s.d_ctx.p, 1, dh, M);
+        rowdot_kernel<<<ceil_div(M, TPB), TPB>>>(s.d_src.p, s.d_tgt.p, s.d_ctx.p, s.d_logit.p, M, dh,
+                                                 std::sqrt((float)dh));
+        logits.resize(M);
+        cuda_check(cudaMemcpy(logits.data(), s.d_logit.p, (size_t)M * sizeof(float),
+                              cudaMemcpyDeviceToHost), "logits download");
+    }
+    cuda_check(cudaGetLastError(), "head kernel launch");
+
+    for (int k = 0; k < K; ++k) {
+        const float* z = &wdl[(size_t)k * 3];
+        const float mx = std::max({z[0], z[1], z[2]});
+        const double e0 = std::exp(z[0] - mx), e1 = std::exp(z[1] - mx), e2 = std::exp(z[2] - mx);
+        const float v = (float)((e0 - e2) / (e0 + e1 + e2));
+        const int lo = fm.board_off[k], n = fm.board_off[k + 1] - lo;
+        out[k] = {v, (M > 0 && n > 0) ? softmax_priors(&logits[lo], n) : std::vector<float>()};
+    }
+    return out;
+}
+
+// Heads on already-computed trunk features Fs (uploads F, then runs the GPU heads). For the
+// head-isolation parity test: feed the SAME F here and to the CPU oracle.
+std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_heads_from_F(
+    const std::vector<std::vector<float>>& Fs,
+    const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+    const int K = (int)Fs.size();
+    if (!p_->ok || !p_->heads_ok || K == 0)
+        return std::vector<std::pair<float, std::vector<float>>>(K);
+    cuda_check(cudaSetDevice(0), "cudaSetDevice");
+    Impl& s = *p_;
+    const int C = s.C;
+    s.d_x.ensure((size_t)K * C * HW);
+    std::vector<float> flat((size_t)K * C * HW);
+    for (int k = 0; k < K; ++k) std::copy(Fs[k].begin(), Fs[k].end(), &flat[(size_t)k * C * HW]);
+    cuda_check(cudaMemcpy(s.d_x.p, flat.data(), flat.size() * sizeof(float), cudaMemcpyHostToDevice),
+               "F upload");
+    return eval_heads_device(K, moves_per);
 }
 
 std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_batch(
@@ -551,22 +792,20 @@ std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_batch(
     const int K = (int)positions.size();
     std::vector<std::pair<float, std::vector<float>>> out(K);
     if (!p_->ok || !p_->net) return out;
-    const auto Fs = run(positions);  // GPU trunk
+    if (p_->heads_ok) {
+        const int kk = run_device(positions);  // GPU trunk, leaves F in d_x.p
+        if (kk == 0) return out;
+        return eval_heads_device(kk, moves_per);  // GPU value + policy heads
+    }
+    // Fallback (no V2 heads): GPU trunk + CPU heads.
+    const auto Fs = run(positions);
     const ChesskersNet& net = *p_->net;
     for (int k = 0; k < K; ++k) {
         const float v = net.value_v2(Fs[k]);
         const int N = (int)moves_per[k].size();
-        std::vector<float> priors(N);
-        if (N == 0) {
-            out[k] = {v, priors};
-            continue;
-        }
+        if (N == 0) { out[k] = {v, std::vector<float>()}; continue; }
         const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
-        const float mx = *std::max_element(logits.begin(), logits.end());
-        double sum = 0.0;
-        for (float l : logits) sum += std::exp(l - mx);
-        for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / sum);
-        out[k] = {v, priors};
+        out[k] = {v, softmax_priors(logits.data(), N)};
     }
     return out;
 }

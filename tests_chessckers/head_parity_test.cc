@@ -23,13 +23,25 @@
 #include "chessckers/encode.hpp"
 #include "chessckers/native_move.hpp"
 #include "chessckers/nn.hpp"
+#if defined(CC_HAVE_CUDA)
+#include "chessckers/nn_cuda.h"
+#else
 #include "chessckers/nn_metal.h"
+#endif
 
 using namespace cc;
 
+#if defined(CC_HAVE_CUDA)
+using Trunk = CudaTrunkV2;
+static constexpr const char* kBackend = "CUDA";
+#else
+using Trunk = MetalTrunkV2;
+static constexpr const char* kBackend = "Metal";
+#endif
+
 static int g_fail = 0;
 
-static void TestFen(const ChesskersNet& net, MetalTrunkV2& metal, const std::string& fen) {
+static void TestFen(const ChesskersNet& net, Trunk& metal, const std::string& fen) {
   Board b = parse_fen(fen);
   auto legal = gen_legal_native(b);
   std::vector<float> pos = encode_position_v2(b);
@@ -70,7 +82,7 @@ static void TestFen(const ChesskersNet& net, MetalTrunkV2& metal, const std::str
 // Batched (K>1) parity: ALL boards in ONE eval — exercises the flattened-M policy head
 // across boards with different move counts (board_off scatter, per-board softmax slices,
 // gfrom=board*100+from across boards). This is the real production scenario.
-static void TestBatch(const ChesskersNet& net, MetalTrunkV2& metal,
+static void TestBatch(const ChesskersNet& net, Trunk& metal,
                       const std::vector<std::string>& fens) {
   std::vector<std::vector<float>> positions;
   std::vector<std::vector<std::vector<float>>> moves_per;
@@ -107,8 +119,9 @@ int main(int argc, char** argv) {
   ChesskersNet net(argv[1]);
   std::printf("net is_v2=%d c_filters=%d d_hidden=%d d_move=%d\n", net.is_v2, net.c_filters,
               net.d_hidden, net.d_move);
-  MetalTrunkV2 metal(net);
-  if (!metal.ok()) { std::printf("MetalTrunkV2 not ok (no GPU?)\n"); return 1; }
+  Trunk metal(net);
+  std::printf("backend: %s\n", kBackend);
+  if (!metal.ok()) { std::printf("%s trunk not ok (no GPU?)\n", kBackend); return 1; }
 
   const std::vector<std::string> fens = {
       // canonical opening (White, double-move) — value + White policy
