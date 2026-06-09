@@ -211,6 +211,71 @@ inline void gelu_(std::vector<float>& x) {
     }
 }
 
+// --- shared head scaffolding (used by the CBLAS oracle AND the Metal/CUDA GPU heads) ---
+
+// Per-board softmax over N policy logits -> priors. Bit-identical to head_v2's original
+// inline softmax (loop-max, then double-accumulated exp sum). Shared so the CPU oracle and
+// the GPU backends (which softmax the downloaded logits on the host) cannot drift.
+inline std::vector<float> softmax_priors(const float* logits, int N) {
+    std::vector<float> p(N);
+    if (N == 0) return p;
+    float mx = logits[0];
+    for (int i = 1; i < N; ++i) mx = std::max(mx, logits[i]);
+    double s = 0.0;
+    for (int i = 0; i < N; ++i) s += std::exp(logits[i] - mx);
+    for (int i = 0; i < N; ++i) p[i] = static_cast<float>(std::exp(logits[i] - mx) / s);
+    return p;
+}
+
+// Flattened, GPU-upload-ready view of moves_per: every board's moves concatenated into M
+// rows tagged with their board. Mirrors the per-move gather inputs of policy_logits_v2
+// (lround of from/to, denom = max(1, sum path mask)) so the GPU heads stay parity-equivalent.
+// board_off[k]..board_off[k+1] is board k's contiguous row range (for scatter + per-board softmax).
+struct FlatMoves {
+    int M = 0, K = 0, n_typ = 0;
+    std::vector<int32_t> board_of;   // [M]
+    std::vector<int32_t> from_idx;   // [M]
+    std::vector<int32_t> to_idx;     // [M]
+    std::vector<float>   denom;      // [M]
+    std::vector<float>   pathmask;   // [M*100]
+    std::vector<float>   typ;        // [M*n_typ]
+    std::vector<int>     board_off;  // [K+1]
+};
+
+inline FlatMoves flatten_moves(const std::vector<std::vector<std::vector<float>>>& moves_per,
+                               int d_move) {
+    FlatMoves fm;
+    fm.K = (int)moves_per.size();
+    fm.n_typ = d_move - 102;                 // trailing type scalars (=12 for V2)
+    fm.board_off.resize(fm.K + 1);
+    int M = 0;
+    for (int k = 0; k < fm.K; ++k) { fm.board_off[k] = M; M += (int)moves_per[k].size(); }
+    fm.board_off[fm.K] = M;
+    fm.M = M;
+    fm.board_of.resize(M);
+    fm.from_idx.resize(M);
+    fm.to_idx.resize(M);
+    fm.denom.resize(M);
+    fm.pathmask.assign((size_t)M * 100, 0.0f);
+    fm.typ.assign((size_t)M * fm.n_typ, 0.0f);
+    for (int k = 0; k < fm.K; ++k) {
+        const auto& mv = moves_per[k];
+        for (int i = 0; i < (int)mv.size(); ++i) {
+            const int r = fm.board_off[k] + i;
+            const std::vector<float>& m = mv[i];
+            fm.board_of[r] = k;
+            fm.from_idx[r] = (int32_t)std::lround(m[0]);
+            fm.to_idx[r] = (int32_t)std::lround(m[1]);
+            double d = 0.0;
+            for (int j = 0; j < 100; ++j) d += m[2 + j];
+            fm.denom[r] = (float)(d < 1.0 ? 1.0 : d);
+            std::copy(m.begin() + 2, m.begin() + 102, &fm.pathmask[(size_t)r * 100]);
+            for (int t = 0; t < fm.n_typ; ++t) fm.typ[(size_t)r * fm.n_typ + t] = m[102 + t];
+        }
+    }
+    return fm;
+}
+
 struct ChesskersNet {
     WeightStore w;
     int c_in = 15, c_filters = 96, d_hidden = 256, d_move = 240;
@@ -575,14 +640,9 @@ struct ChesskersNet {
                                                  const std::vector<std::vector<float>>& moves) const {
         const float v = value_v2(F);
         const int N = (int)moves.size();
-        std::vector<float> priors(N);
-        if (N == 0) return {v, priors};
+        if (N == 0) return {v, std::vector<float>()};
         const auto logits = policy_logits_v2(F, moves);
-        const float mx = *std::max_element(logits.begin(), logits.end());
-        double s = 0.0;
-        for (float l : logits) s += std::exp(l - mx);
-        for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
-        return {v, priors};
+        return {v, softmax_priors(logits.data(), N)};
     }
 
     std::pair<float, std::vector<float>> eval(const std::vector<float>& pos,

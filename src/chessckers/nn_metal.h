@@ -40,6 +40,13 @@ class MetalTrunkV2 {
         const std::vector<std::vector<float>>& positions,
         const std::vector<std::vector<std::vector<float>>>& moves_per) const;
 
+    // Run only the value/policy heads on already-computed trunk features Fs (K maps of
+    // [c_filters*100]). The back half of eval_batch, exposed so a parity harness can feed the
+    // SAME F here and to the CPU oracle (value_v2/policy_logits_v2), isolating the head port.
+    std::vector<std::pair<float, std::vector<float>>> eval_heads_from_F(
+        const std::vector<std::vector<float>>& Fs,
+        const std::vector<std::vector<std::vector<float>>>& moves_per) const;
+
   private:
     struct Impl;
     std::unique_ptr<Impl> p_;
