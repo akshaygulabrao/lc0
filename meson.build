@@ -220,6 +220,53 @@ if host_machine.system() == 'darwin'
     add_project_arguments('-DCC_HAVE_METAL', language: ['cpp', 'objcpp'])
     add_project_arguments('-DACCELERATE_NEW_LAPACK', language: 'objcpp')
   endif
+elif host_machine.system() == 'linux'
+  # The cc:: NN forward (nn.hpp) needs CBLAS (cblas_sgemm) on every platform — on Apple via
+  # Accelerate (above), on Linux via OpenBLAS. Link it UNCONDITIONALLY for the cc:: forward,
+  # independent of the lc0 `blas` BACKEND option (which compiles network_blas.cc, depending on
+  # the fixed-1858 chess-net machinery this fork removed). This mirrors the Apple branch and is
+  # what lets the engine build on a Linux/CUDA box (build with -Dbuild_backends=false).
+  cc_openblas = cc.find_library('openblas', dirs: get_option('openblas_libdirs'), required: true)
+  deps += cc_openblas
+  if not cc.has_header('cblas.h')
+    cblas_found = false
+    foreach d : get_option('openblas_include')
+      if not cblas_found and cc.has_header('cblas.h', args: '-I' + d)
+        includes += include_directories(d)
+        cblas_found = true
+      endif
+    endforeach
+    if not cblas_found
+      error('cblas.h not found. Install libopenblas-dev or set -Dopenblas_include.')
+    endif
+  endif
+
+  # Chessckers GPU trunk on NVIDIA: cc::CudaTrunkV2 (nn_cuda.cu — im2col + cuBLAS SGEMM, custom
+  # groupnorm/relu/posemb/residual kernels). The CUDA analog of the Apple Metal trunk above, and
+  # like it INDEPENDENT of lc0's (disabled) cuda backend and of -Dbuild_backends. Auto-enabled
+  # when nvcc + cublas + cudart are present (-Dnvcc gates it; install the CUDA toolkit for nvcc —
+  # the pytorch -runtime image ships the libs but not nvcc). Defines CC_HAVE_CUDA so the
+  # chessckers backend uses the GPU eval_batch path; falls back to CPU BLAS otherwise.
+  cc_nvcc = find_program('nvcc', '/usr/local/cuda/bin/nvcc', required: false)
+  cc_cublas = cc.find_library('cublas', dirs: get_option('cudnn_libdirs'), required: false)
+  cc_cudart = cc.find_library('cudart', dirs: get_option('cudnn_libdirs'), required: false)
+  if get_option('nvcc') and cc_nvcc.found() and cc_cublas.found() and cc_cudart.found()
+    message('Chessckers: building CUDA GPU trunk (src/chessckers/nn_cuda.cu)')
+    deps += [cc_cublas, cc_cudart]
+    add_project_arguments('-DCC_HAVE_CUDA', language: 'cpp')
+    cc_cuda_nvcc_args = ['-c', '@INPUT@', '-o', '@OUTPUT@',
+                         '-I', meson.current_source_dir() + '/src',
+                         '-I', meson.current_source_dir() + '/src/chessckers',
+                         '-Xcompiler', '-fPIC', '--std=c++17', '-O3',
+                         '-arch=native', '-Wno-deprecated-gpu-targets']
+    foreach d : get_option('cudnn_include')
+      cc_cuda_nvcc_args += ['-I', d]
+    endforeach
+    common_files += custom_target('chessckers cuda trunk',
+      input : 'src/chessckers/nn_cuda.cu',
+      output : 'cc_nn_cuda.o',
+      command : [cc_nvcc, cc_cuda_nvcc_args])
+  endif
 endif
 
 deps += dependency('absl_flat_hash_map', 'absl', modules:['absl::flat_hash_map'],

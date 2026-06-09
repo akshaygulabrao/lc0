@@ -41,6 +41,9 @@
 #ifdef CC_HAVE_METAL
 #include "chessckers/nn_metal.h"
 #endif
+#ifdef CC_HAVE_CUDA
+#include "chessckers/nn_cuda.h"
+#endif
 
 namespace lczero {
 namespace {
@@ -61,7 +64,17 @@ class ChesskersBackend : public Backend {
       }
     }
 #endif
-    if (!metal_enabled()) {
+#ifdef CC_HAVE_CUDA
+    if (!metal_enabled() && net_.is_v2) {
+      auto cuda = std::make_unique<cc::CudaTrunkV2>(net_);
+      if (cuda->ok()) {
+        cuda_ = std::move(cuda);
+        CERR << "Chessckers backend: CUDA GPU trunk enabled (is_v2="
+             << net_.is_v2 << ").";
+      }
+    }
+#endif
+    if (!gpu_enabled()) {
       CERR << "Chessckers backend: CPU BLAS forward (is_v2=" << net_.is_v2
            << ").";
     }
@@ -71,7 +84,7 @@ class ChesskersBackend : public Backend {
     return BackendAttributes{
         .has_mlh = false,
         .has_wdl = false,
-        .runs_on_cpu = !metal_enabled(),
+        .runs_on_cpu = !gpu_enabled(),
         .suggested_num_search_threads = 2,
         // Encourage the search to gather a real minibatch so the batched/GPU
         // trunk pays off (the conv GEMMs fuse across the batch).
@@ -90,6 +103,16 @@ class ChesskersBackend : public Backend {
 #endif
   }
 
+  bool cuda_enabled() const {
+#ifdef CC_HAVE_CUDA
+    return cuda_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  bool gpu_enabled() const { return metal_enabled() || cuda_enabled(); }
+
   const cc::ChesskersNet& net() const { return net_; }
 
   // One fused batched forward over the whole minibatch.
@@ -106,6 +129,15 @@ class ChesskersBackend : public Backend {
       return metal_->eval_batch(positions, moves_per);
     }
 #endif
+#ifdef CC_HAVE_CUDA
+    if (cuda_) {
+      // cuBLAS handle on the default stream: serialize GPU submissions across search
+      // threads (the minibatch is the parallelism; the CPU value/gather heads inside
+      // eval_batch are per-board, exactly as in the Metal path above).
+      std::lock_guard<std::mutex> lk(cuda_mu_);
+      return cuda_->eval_batch(positions, moves_per);
+    }
+#endif
     // CPU BLAS forward is const + re-entrant: safe to call from many threads.
     return net_.eval_batch(positions, moves_per);
   }
@@ -115,6 +147,10 @@ class ChesskersBackend : public Backend {
 #ifdef CC_HAVE_METAL
   std::unique_ptr<cc::MetalTrunkV2> metal_;
   mutable std::mutex metal_mu_;
+#endif
+#ifdef CC_HAVE_CUDA
+  std::unique_ptr<cc::CudaTrunkV2> cuda_;
+  mutable std::mutex cuda_mu_;
 #endif
 };
 
