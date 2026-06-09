@@ -3,8 +3,10 @@
 // Mirrors nn.hpp::ChesskersNet::trunk_v2_batch op-for-op: the conv3x3s go through im2col +
 // one cuBLAS SGEMM per layer (byte-identical column layout to cc::conv3x3_batch); GroupNorm
 // (two-pass mean/var in double, matching groupnorm_), ReLU, pos-emb and residual adds are
-// small custom kernels. The value/gather heads run on the CPU (ChesskersNet, the parity
-// oracle), exactly like MetalTrunkV2::eval_batch.
+// small custom kernels. Transformer blocks (TransformerBlock2d) are supported too — LayerNorm
+// and GELU custom kernels, the qkv/out_proj/ff linears + per-head attention through cuBLAS, and
+// a per-row softmax kernel, mirroring transformer_block_batch_. The value/gather heads run on
+// the CPU (ChesskersNet, the parity oracle), exactly like MetalTrunkV2::eval_batch.
 #include "nn_cuda.h"
 
 #include "nn.hpp"  // ChesskersNet / WeightStore (the CPU forward + parity oracle + heads)
@@ -144,6 +146,115 @@ __global__ void add_posemb_kernel(float* __restrict__ x, const float* __restrict
     if (i < total) x[i] += pe[i % CHW];
 }
 
+// ---- transformer kernels -------------------------------------------------
+// (T == HW == 100 square-tokens; head dim hd = C / n_heads.)
+
+// channel-major board buffer [K][C*T] -> stacked token-major t[K*T, C]. idx walks the source.
+__global__ void chan_to_token_kernel(const float* __restrict__ x, float* __restrict__ t, int K,
+                                     int C, int T) {
+    const long total = (long)K * C * T;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int s = idx % T;
+    const int c = (idx / T) % C;
+    const int k = idx / ((long)C * T);
+    t[(long)(k * T + s) * C + c] = x[idx];  // x[k*C*T + c*T + s]
+}
+
+// inverse: token-major t[K*T, C] -> channel-major x[K][C*T].
+__global__ void token_to_chan_kernel(const float* __restrict__ t, float* __restrict__ x, int K,
+                                     int C, int T) {
+    const long total = (long)K * C * T;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int s = idx % T;
+    const int c = (idx / T) % C;
+    const int k = idx / ((long)C * T);
+    x[idx] = t[(long)(k * T + s) * C + c];
+}
+
+// Per-row LayerNorm over D (double mean/var, matching layernorm_). One thread per row.
+__global__ void layernorm_rows_kernel(float* __restrict__ x, int rows, int D,
+                                      const float* __restrict__ g, const float* __restrict__ b,
+                                      float eps) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float* row = x + (long)i * D;
+    double mean = 0.0;
+    for (int j = 0; j < D; ++j) mean += row[j];
+    mean /= D;
+    double var = 0.0;
+    for (int j = 0; j < D; ++j) {
+        const double d = (double)row[j] - mean;
+        var += d * d;
+    }
+    var /= D;
+    const double inv = 1.0 / sqrt(var + (double)eps);
+    for (int j = 0; j < D; ++j)
+        row[j] = (float)(((double)row[j] - mean) * inv * (double)g[j] + (double)b[j]);
+}
+
+// Add bias[out] broadcast over the R rows of Y[R, out].
+__global__ void add_bias_kernel(float* __restrict__ Y, const float* __restrict__ b, int R,
+                                int out) {
+    const long total = (long)R * out;
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) Y[idx] += b[idx % out];
+}
+
+// Row softmax over `cols` (double accumulation, matching the CPU attention softmax). One
+// thread per row. Reads/writes in place.
+__global__ void softmax_rows_kernel(float* __restrict__ s, int rows, int cols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float* sr = s + (long)i * cols;
+    float mx = sr[0];
+    for (int j = 1; j < cols; ++j)
+        if (sr[j] > mx) mx = sr[j];
+    double sum = 0.0;
+    for (int j = 0; j < cols; ++j) {
+        const float e = (float)exp((double)sr[j] - (double)mx);
+        sr[j] = e;
+        sum += e;
+    }
+    const float inv = (float)(1.0 / sum);
+    for (int j = 0; j < cols; ++j) sr[j] *= inv;
+}
+
+// Exact erf GELU, matching gelu_.
+__global__ void gelu_kernel(float* __restrict__ x, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double z = x[i];
+    x[i] = (float)(0.5 * z * (1.0 + erf(z * 0.70710678118654752440)));
+}
+
+// Gather head `h` of board `k` from qkv[R, 3C] into contiguous Qh/Kh/Vh [T, hd]. PyTorch packs
+// MultiheadAttention as in_proj [3C, C]: Q at [0,C), K at [C,2C), V at [2C,3C); head h is the
+// hd-wide slice at offset off = h*hd within each.
+__global__ void gather_qkv_kernel(const float* __restrict__ qkv, float* __restrict__ Qh,
+                                  float* __restrict__ Kh, float* __restrict__ Vh, int base, int C,
+                                  int hd, int off) {
+    const int n = HW * hd;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int s = idx / hd, d = idx % hd;
+    const float* row = qkv + (long)(base + s) * 3 * C;
+    Qh[idx] = row[off + d];
+    Kh[idx] = row[C + off + d];
+    Vh[idx] = row[2 * C + off + d];
+}
+
+// Scatter Oh[T, hd] for head `h` of board `k` back into attn_out[R, C].
+__global__ void scatter_oh_kernel(const float* __restrict__ Oh, float* __restrict__ attn, int base,
+                                  int C, int hd, int off) {
+    const int n = HW * hd;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int s = idx / hd, d = idx % hd;
+    attn[(long)(base + s) * C + off + d] = Oh[idx];
+}
+
 // ---- device buffers ------------------------------------------------------
 
 struct DBuf {
@@ -172,7 +283,7 @@ float* upload(const std::vector<float>& v) {
 
 struct CudaTrunkV2::Impl {
     const ChesskersNet* net = nullptr;
-    int c_in = 16, C = 96;
+    int c_in = 16, C = 96, n_heads = 4;
     bool ok = false;
     cublasHandle_t handle = nullptr;
 
@@ -183,19 +294,37 @@ struct CudaTrunkV2::Impl {
 
     struct Block {
         bool posemb = false;
+        bool is_tf = false;
         float* pe = nullptr;  // posemb: [C*HW]
+        // residual block
         float* conv1_w = nullptr;
         float* bn1_g = nullptr;
         float* bn1_b = nullptr;
         float* conv2_w = nullptr;
         float* bn2_g = nullptr;
         float* bn2_b = nullptr;
+        // transformer block (TransformerBlock2d); ff_dim = ff_mult * C
+        int ff_dim = 0;
+        float* norm1_g = nullptr;
+        float* norm1_b = nullptr;
+        float* in_proj_w = nullptr;   // [3C, C]
+        float* in_proj_b = nullptr;   // [3C]
+        float* out_proj_w = nullptr;  // [C, C]
+        float* out_proj_b = nullptr;  // [C]
+        float* norm2_g = nullptr;
+        float* norm2_b = nullptr;
+        float* ff0_w = nullptr;  // [ff_dim, C]
+        float* ff0_b = nullptr;  // [ff_dim]
+        float* ff2_w = nullptr;  // [C, ff_dim]
+        float* ff2_b = nullptr;  // [C]
     };
     std::vector<Block> blocks;
     std::vector<float*> owned;  // every device weight ptr, for cleanup
 
     // scratch (grown on demand; the backend serializes eval through one GPU mutex)
     mutable DBuf d_in, d_col, d_gemm, d_x, d_c1, d_c2;
+    // transformer-block scratch (only grown for nets that actually have tf blocks)
+    mutable DBuf d_t, d_tn, d_tn2, d_qkv, d_h1, d_q, d_k, d_v, d_sc, d_oh;
 
     float* track(float* p) {
         owned.push_back(p);
@@ -212,6 +341,7 @@ CudaTrunkV2::CudaTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>())
     p_->net = &net;
     p_->c_in = net.c_in;
     p_->C = net.c_filters;
+    p_->n_heads = net.n_heads;
 
     int devs = 0;
     if (cudaGetDeviceCount(&devs) != cudaSuccess || devs == 0) return;  // no GPU -> ok stays false
@@ -241,11 +371,23 @@ CudaTrunkV2::CudaTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>())
                 b.bn2_g = p_->track(upload(w.at(pfx + "bn2.weight")));
                 b.bn2_b = p_->track(upload(w.at(pfx + "bn2.bias")));
                 p_->blocks.push_back(b);
-            } else if (w.tensors.count(pfx + "attn.in_proj_weight")) {
-                // Transformer block: not supported by this CUDA MVP. Leave ok=false so the
-                // chessckers backend falls back to the CPU forward (the same escape hatch as
-                // Metal's "unsupported block"). Deployed nets use --tf-blocks=0 (pure ResNet).
-                return;
+            } else if (w.tensors.count(pfx + "attn.in_proj_weight")) {  // TransformerBlock2d
+                Impl::Block b;
+                b.is_tf = true;
+                b.ff_dim = (int)w.at(pfx + "ff.0.bias").size();
+                b.norm1_g = p_->track(upload(w.at(pfx + "norm1.weight")));
+                b.norm1_b = p_->track(upload(w.at(pfx + "norm1.bias")));
+                b.in_proj_w = p_->track(upload(w.at(pfx + "attn.in_proj_weight")));
+                b.in_proj_b = p_->track(upload(w.at(pfx + "attn.in_proj_bias")));
+                b.out_proj_w = p_->track(upload(w.at(pfx + "attn.out_proj.weight")));
+                b.out_proj_b = p_->track(upload(w.at(pfx + "attn.out_proj.bias")));
+                b.norm2_g = p_->track(upload(w.at(pfx + "norm2.weight")));
+                b.norm2_b = p_->track(upload(w.at(pfx + "norm2.bias")));
+                b.ff0_w = p_->track(upload(w.at(pfx + "ff.0.weight")));
+                b.ff0_b = p_->track(upload(w.at(pfx + "ff.0.bias")));
+                b.ff2_w = p_->track(upload(w.at(pfx + "ff.2.weight")));
+                b.ff2_b = p_->track(upload(w.at(pfx + "ff.2.bias")));
+                p_->blocks.push_back(b);
             } else {
                 break;  // end of trunk
             }
@@ -268,6 +410,7 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
 
     cuda_check(cudaSetDevice(0), "cudaSetDevice");
     const int C = p_->C, Cin = p_->c_in, COLS = K * HW;
+    const int Hn = p_->n_heads, hd = (Hn > 0) ? C / Hn : C, R = K * HW;
     Impl& s = *p_;
     s.d_in.ensure((size_t)K * Cin * HW);
     s.d_col.ensure((size_t)C * 9 * COLS);  // max input channels across layers is C
@@ -275,6 +418,22 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
     s.d_x.ensure((size_t)K * C * HW);
     s.d_c1.ensure((size_t)K * C * HW);
     s.d_c2.ensure((size_t)K * C * HW);
+    // transformer scratch — only allocated for nets that actually carry tf blocks.
+    int max_ff = 0;
+    for (const Impl::Block& b : s.blocks)
+        if (b.is_tf) max_ff = std::max(max_ff, b.ff_dim);
+    if (max_ff > 0) {
+        s.d_t.ensure((size_t)R * C);
+        s.d_tn.ensure((size_t)R * C);
+        s.d_tn2.ensure((size_t)R * C);
+        s.d_qkv.ensure((size_t)R * 3 * C);
+        s.d_h1.ensure((size_t)R * max_ff);
+        s.d_q.ensure((size_t)HW * hd);
+        s.d_k.ensure((size_t)HW * hd);
+        s.d_v.ensure((size_t)HW * hd);
+        s.d_sc.ensure((size_t)HW * HW);
+        s.d_oh.ensure((size_t)HW * hd);
+    }
 
     // upload positions -> d_in (board-major [K][c_in*HW]; positions[k] is flat NCHW [c_in*100])
     std::vector<float> flat((size_t)K * Cin * HW);
@@ -300,6 +459,59 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
     };
     const long NX = (long)K * C * HW;
 
+    // One pre-norm transformer block over the 100 square-tokens, in place on d_x. Mirrors
+    // ChesskersNet::transformer_block_batch_ op-for-op: token-major transpose, LayerNorm, qkv
+    // linear, per-(board,head) scaled-dot-product attention + softmax, out_proj residual, then
+    // LayerNorm + GELU FFN residual. Linears go through cuBLAS; LN/softmax/GELU/transpose are the
+    // custom kernels above. d_tn holds LN1 then is overwritten by the attention output (scatter
+    // writes every (token,channel) exactly once), so no stale data survives.
+    auto tf = [&](const Impl::Block& b) {
+        const int ff = b.ff_dim;
+        // Y[R,out] = X[R,in] @ W[out,in]^T + bias (W row-major [out,in]); mirrors linear_batch.
+        // Row-major-via-column-major: same mapping the conv lambda uses, with W transposed.
+        auto lin = [&](const float* Wd, const float* bd, const float* X, float* Y, int out, int in_) {
+            cublasSgemm(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, out, R, in_, &one, Wd, in_, X, in_, &zero,
+                        Y, out);
+            add_bias_kernel<<<ceil_div((long)R * out, TPB), TPB>>>(Y, bd, R, out);
+        };
+        // t = token-major(x); n = LayerNorm1(t)
+        chan_to_token_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_x.p, s.d_t.p, K, C, HW);
+        cuda_check(cudaMemcpy(s.d_tn.p, s.d_t.p, (size_t)R * C * sizeof(float),
+                              cudaMemcpyDeviceToDevice), "tf LN1 copy");
+        layernorm_rows_kernel<<<ceil_div(R, TPB), TPB>>>(s.d_tn.p, R, C, b.norm1_g, b.norm1_b, 1e-5f);
+        // qkv[R,3C] = in_proj(n)
+        lin(b.in_proj_w, b.in_proj_b, s.d_tn.p, s.d_qkv.p, 3 * C, C);
+        // per-board, per-head attention -> attn_out in d_tn
+        const float scale = 1.0f / std::sqrt((float)hd);
+        for (int k = 0; k < K; ++k)
+            for (int h = 0; h < Hn; ++h) {
+                const int base = k * HW, off = h * hd;
+                gather_qkv_kernel<<<ceil_div(HW * hd, TPB), TPB>>>(s.d_qkv.p, s.d_q.p, s.d_k.p,
+                                                                  s.d_v.p, base, C, hd, off);
+                // scores[T,T] = (Qh @ Kh^T) * scale ; row softmax ; Oh[T,hd] = scores @ Vh
+                cublasSgemm(s.handle, CUBLAS_OP_T, CUBLAS_OP_N, HW, HW, hd, &scale, s.d_k.p, hd,
+                            s.d_q.p, hd, &zero, s.d_sc.p, HW);
+                softmax_rows_kernel<<<ceil_div(HW, TPB), TPB>>>(s.d_sc.p, HW, HW);
+                cublasSgemm(s.handle, CUBLAS_OP_N, CUBLAS_OP_N, hd, HW, HW, &one, s.d_v.p, hd,
+                            s.d_sc.p, HW, &zero, s.d_oh.p, hd);
+                scatter_oh_kernel<<<ceil_div(HW * hd, TPB), TPB>>>(s.d_oh.p, s.d_tn.p, base, C, hd,
+                                                                  off);
+            }
+        // t += out_proj(attn_out)
+        lin(b.out_proj_w, b.out_proj_b, s.d_tn.p, s.d_tn2.p, C, C);
+        add_kernel<<<ceil_div((long)R * C, TPB), TPB>>>(s.d_t.p, s.d_tn2.p, (long)R * C);
+        // n2 = LayerNorm2(t) ; h1 = GELU(ff0(n2)) ; t += ff2(h1)
+        cuda_check(cudaMemcpy(s.d_tn.p, s.d_t.p, (size_t)R * C * sizeof(float),
+                              cudaMemcpyDeviceToDevice), "tf LN2 copy");
+        layernorm_rows_kernel<<<ceil_div(R, TPB), TPB>>>(s.d_tn.p, R, C, b.norm2_g, b.norm2_b, 1e-5f);
+        lin(b.ff0_w, b.ff0_b, s.d_tn.p, s.d_h1.p, ff, C);
+        gelu_kernel<<<ceil_div((long)R * ff, TPB), TPB>>>(s.d_h1.p, (long)R * ff);
+        lin(b.ff2_w, b.ff2_b, s.d_h1.p, s.d_tn2.p, C, ff);
+        add_kernel<<<ceil_div((long)R * C, TPB), TPB>>>(s.d_t.p, s.d_tn2.p, (long)R * C);
+        // x = channel-major(t)
+        token_to_chan_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_t.p, s.d_x.p, K, C, HW);
+    };
+
     // stem: conv -> groupnorm -> relu
     conv(s.d_in.p, Cin, s.stem_w, s.d_x.p);
     gnorm(s.d_x.p, s.stem_gn_g, s.stem_gn_b, /*relu=*/1);
@@ -308,6 +520,8 @@ std::vector<std::vector<float>> CudaTrunkV2::run(
     for (const Impl::Block& b : s.blocks) {
         if (b.posemb) {
             add_posemb_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_x.p, b.pe, K, C * HW);
+        } else if (b.is_tf) {
+            tf(b);
         } else {
             conv(s.d_x.p, C, b.conv1_w, s.d_c1.p);        // c1 = conv1(x)
             gnorm(s.d_c1.p, b.bn1_g, b.bn1_b, /*relu=*/1);
