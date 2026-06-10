@@ -203,6 +203,29 @@ inline void relu_(std::vector<float>& x) {
         if (v < 0) v = 0;
 }
 
+// Squeeze-Excitation channel recalibration (V4 SEResidualBlock), in place on the
+// post-conv2 map `c2` [C,HW] BEFORE the residual add. Mirrors model.SEResidualBlock:
+// squeeze = mean over HW per channel, excite = sigmoid(fc2(relu(fc1(s)))), then scale
+// each channel by its gate. Reduction cr is read off se_fc1.bias length.
+inline void squeeze_excite_(std::vector<float>& c2, int C, int HW,
+                            const std::vector<float>& fc1_w, const std::vector<float>& fc1_b,
+                            const std::vector<float>& fc2_w, const std::vector<float>& fc2_b) {
+    const int cr = static_cast<int>(fc1_b.size());
+    std::vector<float> s(C);
+    for (int c = 0; c < C; ++c) {
+        double m = 0.0;                                   // double accum (matches groupnorm discipline)
+        for (int i = 0; i < HW; ++i) m += c2[(size_t)c * HW + i];
+        s[c] = static_cast<float>(m / HW);
+    }
+    auto h = linear_batch(s, 1, fc1_w, fc1_b, cr, C);     // s @ fc1^T + b1  -> [cr]
+    relu_(h);
+    auto g = linear_batch(h, 1, fc2_w, fc2_b, C, cr);     // h @ fc2^T + b2  -> [C]
+    for (int c = 0; c < C; ++c) {
+        const float gate = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(g[c]))));
+        for (int i = 0; i < HW; ++i) c2[(size_t)c * HW + i] *= gate;
+    }
+}
+
 // Exact GELU (erf form) — matches PyTorch nn.GELU() default (approximate='none').
 inline void gelu_(std::vector<float>& x) {
     for (float& v : x) {
@@ -496,12 +519,17 @@ struct ChesskersNet {
             if (w.tensors.count(p + "pos")) {                             // _AddSpatialPosEmb
                 const auto& pe = w.at(p + "pos");                         // [1,c_filters,10,10]
                 for (size_t i = 0; i < x.size(); ++i) x[i] += pe[i];
-            } else if (w.tensors.count(p + "conv1.weight")) {             // ResidualBlock
+            } else if (w.tensors.count(p + "conv1.weight")) {             // ResidualBlock (+SE = V4)
                 auto c1 = conv3x3(x, c_filters, w.at(p + "conv1.weight"), c_filters, 10, 10);
                 groupnorm_(c1, c_filters, 8, w.at(p + "bn1.weight"), w.at(p + "bn1.bias"), 1e-5f, HW);
                 relu_(c1);
                 auto c2 = conv3x3(c1, c_filters, w.at(p + "conv2.weight"), c_filters, 10, 10);
                 groupnorm_(c2, c_filters, 8, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"), 1e-5f, HW);
+                if (w.tensors.count(p + "se_fc1.weight")) {               // V4 Squeeze-Excitation
+                    squeeze_excite_(c2, c_filters, HW,
+                                    w.at(p + "se_fc1.weight"), w.at(p + "se_fc1.bias"),
+                                    w.at(p + "se_fc2.weight"), w.at(p + "se_fc2.bias"));
+                }
                 for (size_t i = 0; i < x.size(); ++i) c2[i] += x[i];
                 relu_(c2);
                 x = std::move(c2);
@@ -543,6 +571,11 @@ struct ChesskersNet {
                 for (int k2 = 0; k2 < K; ++k2) {
                     auto& c2 = c2s[k2];
                     groupnorm_(c2, c_filters, 8, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"), 1e-5f, HW);
+                    if (w.tensors.count(p + "se_fc1.weight")) {           // V4 Squeeze-Excitation
+                        squeeze_excite_(c2, c_filters, HW,
+                                        w.at(p + "se_fc1.weight"), w.at(p + "se_fc1.bias"),
+                                        w.at(p + "se_fc2.weight"), w.at(p + "se_fc2.bias"));
+                    }
                     for (size_t i = 0; i < c2.size(); ++i) c2[i] += xs[k2][i];
                     relu_(c2);
                 }

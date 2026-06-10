@@ -54,8 +54,11 @@ class ChesskersBackend : public Backend {
  public:
   explicit ChesskersBackend(const OptionsDict& options)
       : net_(options.Get<std::string>(SharedBackendParams::kWeightsId)) {
+    // CC_FORCE_CPU=1 skips the GPU trunks and runs the CPU BLAS forward — used to
+    // parity-check the GPU backends against the CPU oracle (e.g. for the V4 SE port).
+    const bool force_cpu = std::getenv("CC_FORCE_CPU") != nullptr;
 #ifdef CC_HAVE_METAL
-    if (net_.is_v2) {
+    if (!force_cpu && net_.is_v2) {
       auto metal = std::make_unique<cc::MetalTrunkV2>(net_);
       if (metal->ok()) {
         metal_ = std::move(metal);
@@ -65,7 +68,7 @@ class ChesskersBackend : public Backend {
     }
 #endif
 #ifdef CC_HAVE_CUDA
-    if (!metal_enabled() && net_.is_v2) {
+    if (!force_cpu && !metal_enabled() && net_.is_v2) {
       auto cuda = std::make_unique<cc::CudaTrunkV2>(net_);
       if (cuda->ok()) {
         cuda_ = std::move(cuda);
@@ -131,10 +134,14 @@ class ChesskersBackend : public Backend {
 #endif
 #ifdef CC_HAVE_CUDA
     if (cuda_) {
-      // cuBLAS handle on the default stream: serialize GPU submissions across search
-      // threads (the minibatch is the parallelism; the CPU value/gather heads inside
-      // eval_batch are per-board, exactly as in the Metal path above).
-      std::lock_guard<std::mutex> lk(cuda_mu_);
+      // ONE GPU, legacy default stream: serialize CUDA eval across ALL backend
+      // instances (lc0 builds several), not just this one. A per-instance mutex
+      // left concurrent host-side CUDA work (cudaMalloc in DBuf::ensure, cuBLAS
+      // workspace) from sibling instances racing on the shared default stream —
+      // an illegal-memory-access under load. The device work is already
+      // serialized on stream 0, so this process-wide lock costs ~nothing.
+      static std::mutex cuda_global_mu;
+      std::lock_guard<std::mutex> lk(cuda_global_mu);
       return cuda_->eval_batch(positions, moves_per);
     }
 #endif

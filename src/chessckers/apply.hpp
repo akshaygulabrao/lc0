@@ -183,8 +183,14 @@ inline void apply_chain_move(Board& b, const BlackMove& mv) {
 // White. castling/ep/clocks are deliberately left unchanged.
 inline void apply_black_move(Board& b, const BlackMove& mv) {
     if (mv.has_deploy_count) apply_deploy(b, mv);
-    else if (is_orthogonal(mv.from_sq, mv.to_sq)) apply_charge(b, mv);
+    // A diagonal capture chain is identified by chain_hops and MUST dispatch as a
+    // chain even when its net origin->landing displacement is orthogonal (a chain
+    // can start and end on the same rank/file, e.g. c3~e1~g3 or g1~i3~g5). Checking
+    // is_orthogonal first would misroute it to apply_charge, which walks the straight
+    // origin->dest line and captures whatever sits on it (e.g. a king the chain never
+    // touched). Must mirror PyVariant's apply_black_move_known dispatch order.
     else if (mv.has_chain_hops) apply_chain_move(b, mv);
+    else if (is_orthogonal(mv.from_sq, mv.to_sq)) apply_charge(b, mv);
     else if (mv.has_capture) apply_diagonal_capture(b, mv);
     else apply_quiet_or_sprint(b, mv);
     b.turn_white = true;

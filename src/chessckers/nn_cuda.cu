@@ -271,6 +271,15 @@ __global__ void pool_mean_kernel(const float* __restrict__ F, float* __restrict_
     pooled[idx] = (float)(s / HW);
 }
 
+// V4 Squeeze-Excitation gate: scale c2[K][C*HW] by sigmoid(g[K][C]) per (board,channel).
+// double exp matches squeeze_excite_ (the CPU oracle). One thread per element.
+__global__ void se_scale_kernel(float* __restrict__ c2, const float* __restrict__ g, int K, int C) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // k*C*HW + c*HW + i
+    if (idx >= (long)K * C * HW) return;
+    const int kc = (int)(idx / HW);                               // k*C + c
+    c2[idx] *= (float)(1.0 / (1.0 + exp(-(double)g[kc])));
+}
+
 // Gather FF[i,c]=F[board[i]][c][from[i]] and TF[i,c]=F[...][to[i]] (policy_logits_v2 gather).
 __global__ void gather_endpoints_kernel(const float* __restrict__ F, const int* __restrict__ board,
                                         const int* __restrict__ from, const int* __restrict__ to,
@@ -332,11 +341,30 @@ __global__ void rowdot_kernel(const float* __restrict__ src, const float* __rest
 
 // Y[R,out] = X[R,in] @ W[out,in]^T + bias (W row-major [out,in]); mirrors linear_batch.
 // Hoisted from run()'s tf lambda so the value/policy heads share it (R = K or M).
-inline void lin_gemm(cublasHandle_t handle, const float* Wd, const float* bd, const float* X,
+// Y[r,o] = bd[o] + sum_i Wd[o,i]*X[r,i]   (Wd is PyTorch Linear weight [out,in],
+// X is [R,in] row-major, Y is [R,out] row-major). One thread per (r,o) output.
+// This replaces the cublasSgemm(OP_T) path that lin_gemm used for the small head/SE
+// linears: when the search batch collapses to R=K=1, cuBLAS dispatched a
+// strided-batched gemv that over-read the tightly-sized operand far past its end
+// (an illegal access on CUDA; silently wrong on CPU). This kernel touches only
+// [0,R*out) of Y and [0,*) of the inputs, so it is exactly bounded. Double accum
+// keeps it at least as accurate as the cblas CPU oracle.
+__global__ void linear_kernel(const float* __restrict__ Wd, const float* __restrict__ bd,
+                              const float* __restrict__ X, float* __restrict__ Y, int out, int in_,
+                              int R) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;  // r*out + o
+    if (idx >= (long)R * out) return;
+    const int r = (int)(idx / out), o = (int)(idx % out);
+    const float* wp = Wd + (long)o * in_;
+    const float* xp = X + (long)r * in_;
+    double acc = bd ? (double)bd[o] : 0.0;
+    for (int i = 0; i < in_; ++i) acc += (double)wp[i] * (double)xp[i];
+    Y[idx] = (float)acc;
+}
+
+inline void lin_gemm(cublasHandle_t /*handle*/, const float* Wd, const float* bd, const float* X,
                      float* Y, int out, int in_, int R) {
-    const float one = 1.0f, zero = 0.0f;
-    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, out, R, in_, &one, Wd, in_, X, in_, &zero, Y, out);
-    add_bias_kernel<<<ceil_div((long)R * out, TPB), TPB>>>(Y, bd, R, out);
+    linear_kernel<<<ceil_div((long)R * out, TPB), TPB>>>(Wd, bd, X, Y, out, in_, R);
 }
 
 // ---- device buffers ------------------------------------------------------
@@ -347,7 +375,12 @@ struct DBuf {
     void ensure(size_t n) {
         if (n <= cap) return;
         if (p) cudaFree(p);
-        cuda_check(cudaMalloc(&p, n * sizeof(float)), "cudaMalloc scratch");
+        // Small defensive over-allocation so any vectorized cuBLAS kernel that
+        // reads its operand in fixed-width tiles can't fault on a tightly-sized
+        // buffer. (The K=1 gemv over-read that motivated this is fixed properly in
+        // lin_gemm/linear_kernel; this pad is cheap insurance for the trunk GEMMs.)
+        const size_t pad = 64;
+        cuda_check(cudaMalloc(&p, (n + pad) * sizeof(float)), "cudaMalloc scratch");
         cap = n;
     }
     ~DBuf() {
@@ -362,7 +395,7 @@ struct IBuf {
     void ensure(size_t n) {
         if (n <= cap) return;
         if (p) cudaFree(p);
-        cuda_check(cudaMalloc(&p, n * sizeof(int)), "cudaMalloc iscratch");
+        cuda_check(cudaMalloc(&p, (n + 64) * sizeof(int)), "cudaMalloc iscratch");
         cap = n;
     }
     ~IBuf() {
@@ -372,7 +405,7 @@ struct IBuf {
 
 float* upload(const std::vector<float>& v) {
     float* d = nullptr;
-    cuda_check(cudaMalloc(&d, v.size() * sizeof(float)), "cudaMalloc weight");
+    cuda_check(cudaMalloc(&d, (v.size() + 64) * sizeof(float)), "cudaMalloc weight");
     cuda_check(cudaMemcpy(d, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice),
                "cudaMemcpy weight");
     return d;
@@ -402,6 +435,13 @@ struct CudaTrunkV2::Impl {
         float* conv2_w = nullptr;
         float* bn2_g = nullptr;
         float* bn2_b = nullptr;
+        // V4 Squeeze-Excitation (present iff has_se); cr = se bottleneck width
+        bool has_se = false;
+        int cr = 0;
+        float* se_fc1_w = nullptr;
+        float* se_fc1_b = nullptr;
+        float* se_fc2_w = nullptr;
+        float* se_fc2_b = nullptr;
         // transformer block (TransformerBlock2d); ff_dim = ff_mult * C
         int ff_dim = 0;
         float* norm1_g = nullptr;
@@ -422,6 +462,8 @@ struct CudaTrunkV2::Impl {
 
     // scratch (grown on demand; the backend serializes eval through one GPU mutex)
     mutable DBuf d_in, d_col, d_gemm, d_x, d_c1, d_c2;
+    // V4 SE scratch (only grown for nets that carry SE blocks): squeeze s[K,C], hidden h[K,cr], gate g[K,C]
+    mutable DBuf d_se_s, d_se_h, d_se_g;
     // transformer-block scratch (only grown for nets that actually have tf blocks)
     mutable DBuf d_t, d_tn, d_tn2, d_qkv, d_h1, d_q, d_k, d_v, d_sc, d_oh;
 
@@ -486,6 +528,14 @@ CudaTrunkV2::CudaTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>())
                 b.conv2_w = p_->track(upload(w.at(pfx + "conv2.weight")));
                 b.bn2_g = p_->track(upload(w.at(pfx + "bn2.weight")));
                 b.bn2_b = p_->track(upload(w.at(pfx + "bn2.bias")));
+                if (w.tensors.count(pfx + "se_fc1.weight")) {       // V4 Squeeze-Excitation
+                    b.has_se = true;
+                    b.cr = (int)w.at(pfx + "se_fc1.bias").size();
+                    b.se_fc1_w = p_->track(upload(w.at(pfx + "se_fc1.weight")));
+                    b.se_fc1_b = p_->track(upload(w.at(pfx + "se_fc1.bias")));
+                    b.se_fc2_w = p_->track(upload(w.at(pfx + "se_fc2.weight")));
+                    b.se_fc2_b = p_->track(upload(w.at(pfx + "se_fc2.bias")));
+                }
                 p_->blocks.push_back(b);
             } else if (w.tensors.count(pfx + "attn.in_proj_weight")) {  // TransformerBlock2d
                 Impl::Block b;
@@ -560,6 +610,15 @@ int CudaTrunkV2::run_device(const std::vector<std::vector<float>>& positions) co
     s.d_x.ensure((size_t)K * C * HW);
     s.d_c1.ensure((size_t)K * C * HW);
     s.d_c2.ensure((size_t)K * C * HW);
+    // V4 SE scratch — only allocated for nets that carry SE blocks.
+    int max_cr = 0;
+    for (const Impl::Block& b : s.blocks)
+        if (b.has_se) max_cr = std::max(max_cr, b.cr);
+    if (max_cr > 0) {
+        s.d_se_s.ensure((size_t)K * C);
+        s.d_se_h.ensure((size_t)K * max_cr);
+        s.d_se_g.ensure((size_t)K * C);
+    }
     // transformer scratch — only allocated for nets that actually carry tf blocks.
     int max_ff = 0;
     for (const Impl::Block& b : s.blocks)
@@ -667,6 +726,16 @@ int CudaTrunkV2::run_device(const std::vector<std::vector<float>>& positions) co
             gnorm(s.d_c1.p, b.bn1_g, b.bn1_b, /*relu=*/1);
             conv(s.d_c1.p, C, b.conv2_w, s.d_c2.p);       // c2 = conv2(c1)
             gnorm(s.d_c2.p, b.bn2_g, b.bn2_b, /*relu=*/0);
+            if (b.has_se) {                               // V4 Squeeze-Excitation on c2
+                pool_mean_kernel<<<ceil_div((long)K * C, TPB), TPB>>>(s.d_c2.p, s.d_se_s.p, K, C);
+                // lin_gemm args are (out, in_, R=batch). fc1: squeeze[K,C] -> hidden[K,cr];
+                // fc2: hidden[K,cr] -> gate[K,C]. (Previously these passed out=K, which
+                // strided the kernel far past the cr-sized hidden vector -> illegal read.)
+                lin_gemm(s.handle, b.se_fc1_w, b.se_fc1_b, s.d_se_s.p, s.d_se_h.p, b.cr, C, K);
+                relu_kernel<<<ceil_div((long)K * b.cr, TPB), TPB>>>(s.d_se_h.p, (long)K * b.cr);
+                lin_gemm(s.handle, b.se_fc2_w, b.se_fc2_b, s.d_se_h.p, s.d_se_g.p, C, b.cr, K);
+                se_scale_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_c2.p, s.d_se_g.p, K, C);
+            }
             add_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_c2.p, s.d_x.p, NX);  // c2 += x
             relu_kernel<<<ceil_div(NX, TPB), TPB>>>(s.d_c2.p, NX);          // relu(c2)
             cuda_check(cudaMemcpy(s.d_x.p, s.d_c2.p, NX * sizeof(float), cudaMemcpyDeviceToDevice),

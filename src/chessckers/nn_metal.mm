@@ -278,6 +278,18 @@ MetalTrunkV2::MetalTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>(
                 c1 = [g reLUWithTensor:c1 name:nil];
                 MPSGraphTensor* c2 = convOp(g, c1, w.at(p + "conv2.weight"), C, C);
                 c2 = groupNorm(g, c2, C, 8, HW, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"));
+                if (w.tensors.count(p + "se_fc1.weight")) {  // V4 Squeeze-Excitation
+                    const int cr = (int)w.at(p + "se_fc1.bias").size();
+                    MPSGraphTensor* se = [g meanOfTensor:c2 axes:@[ @2, @3 ] name:nil];   // [N,C,1,1]
+                    se = [g reshapeTensor:se withShape:@[ @(-1), @1, @(C) ] name:nil];    // [N,1,C]
+                    se = linearLast(g, se, w.at(p + "se_fc1.weight"), w.at(p + "se_fc1.bias"), cr, C);
+                    se = [g reLUWithTensor:se name:nil];
+                    se = linearLast(g, se, w.at(p + "se_fc2.weight"), w.at(p + "se_fc2.bias"), C, cr);
+                    se = [g sigmoidWithTensor:se name:nil];                               // [N,1,C]
+                    MPSGraphTensor* gate = [g reshapeTensor:se
+                                                  withShape:@[ @(-1), @(C), @1, @1 ] name:nil];
+                    c2 = [g multiplicationWithPrimaryTensor:c2 secondaryTensor:gate name:nil];
+                }
                 c2 = [g additionWithPrimaryTensor:c2 secondaryTensor:x name:nil];
                 x = [g reLUWithTensor:c2 name:nil];
             } else if (w.tensors.count(p + "attn.in_proj_weight")) {
