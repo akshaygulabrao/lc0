@@ -594,12 +594,8 @@ void BaseSearchParams::Populate(OptionsParser* options) {
                                          "WDL_mu"};
   options->Add<ChoiceOption>(kScoreTypeId, score_type) = "WDL_mu";
   std::vector<std::string> history_fill_opt{"no", "fen_only", "always"};
-  // Chessckers: lower the MLH threshold only (cap/slope left at lc0 defaults) so a
-  // losing Black actually ENGAGES the stall incentive. Default 0.8 gated MLH off
-  // for Black (its |Q|~0.70 < 0.8); 0.5 turns it on. Isolated change — if stalling
-  // is still too weak, raise the max-effect/slope next.
   options->Add<FloatOption>(kMovesLeftMaxEffectId, 0.0f, 1.0f) = 0.0345f;
-  options->Add<FloatOption>(kMovesLeftThresholdId, 0.0f, 1.0f) = 0.5f;
+  options->Add<FloatOption>(kMovesLeftThresholdId, 0.0f, 1.0f) = 0.8f;
   options->Add<FloatOption>(kMovesLeftSlopeId, 0.0f, 1.0f) = 0.0027f;
   options->Add<FloatOption>(kMovesLeftConstantFactorId, -1.0f, 1.0f) = 0.0f;
   options->Add<FloatOption>(kMovesLeftScaledFactorId, -2.0f, 2.0f) = 1.6521f;
