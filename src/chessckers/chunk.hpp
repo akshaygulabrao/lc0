@@ -16,6 +16,7 @@
 // position/move/target tensors as az_game_to_examples of the equivalent game.
 // Floats are emitted at 17 significant digits so json.loads recovers the exact
 // same IEEE-754 double C++ computed (v/total is deterministic across both).
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -306,6 +307,24 @@ inline std::string encode_chunk(const PureGame& game) {
             json_double(o, wdl[k]);
         }
         o += ']';
+        // search_wdl (Lever 3): the search's root value as [w,d,l] from STM POV, same
+        // frame as wdl_target so the trainer can blend them; null when this ply has no
+        // recorded search value (root_q is NaN) → trainer falls back to pure z.
+        if (std::isnan(rec.root_q)) {
+            j.null("search_wdl");
+        } else {
+            const double d = std::isnan(rec.root_d) ? 0.0 : rec.root_d;
+            const double w = ((1.0 - d) + rec.root_q) / 2.0;
+            const double l = ((1.0 - d) - rec.root_q) / 2.0;
+            j.key("search_wdl");
+            o += '[';
+            json_double(o, w);
+            o += ',';
+            json_double(o, d);
+            o += ',';
+            json_double(o, l);
+            o += ']';
+        }
         j.d("moves_left_target", static_cast<double>(n - i));
         j.end();
     }

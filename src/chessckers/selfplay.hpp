@@ -38,6 +38,11 @@ struct PureRecord {
     std::vector<NativeMove> legal;
     std::vector<int> visits;  // aligned with `legal`
     bool side_white;
+    // Search root value (STM-relative) for value-target bootstrapping; NaN = this
+    // self-play path recorded none → encode emits search_wdl:null (trainer falls
+    // back to the game outcome z). Set only where a full WDL is available.
+    float root_q = NAN;  // -node->GetWL()  (>0: STM winning)
+    float root_d = NAN;  // node->GetD()    (draw probability)
 };
 
 struct PureGame {

@@ -289,6 +289,11 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       cc::PureRecord rec;
       rec.fen = BoardToFen(tree_[idx]->GetPositionHistory().Last().GetBoard());
       rec.side_white = !tree_[idx]->IsBlackToMove();
+      // Lever 3: record the searched root's value (STM-relative WDL) so the trainer
+      // can bootstrap the value target from search q, not only the noisy outcome z.
+      // Mirrors lc0 V6 root_q/root_d (trainingdata.cc): q = -GetWL(), d = GetD().
+      rec.root_q = -node->GetWL();
+      rec.root_d = node->GetD();
       for (const auto& edge : node->Edges()) {
         rec.legal.push_back(*edge.GetMove(false).native());
         rec.visits.push_back(static_cast<int>(edge.GetN()));
