@@ -303,6 +303,7 @@ struct ChesskersNet {
     WeightStore w;
     int c_in = 15, c_filters = 96, d_hidden = 256, d_move = 240;
     bool is_v2 = false;   // ChesskersScorerV2: square-grounded gather head + (optional) transformer trunk
+    bool has_moves_left = false;  // net carries the moves-left head (model.moves_left_head); see ctor
     int n_heads = 4;
 
     explicit ChesskersNet(const std::string& path) : w(load_weights(path)) {
@@ -318,6 +319,11 @@ struct ChesskersNet {
             d_hidden = sp->second.shape[0];
             c_filters = sp->second.shape[1];
         }
+        // Moves-left head (model.ChesskersScorerV2.moves_left_head): a value-head twin off
+        // the shared value_trunk embedding. Optional — older nets predate the exported head,
+        // so detect it and leave M at 0 when absent (the lc0 search just won't use a moves-left
+        // effect). V2-only: production is V2/V4; the V1 trunk's head isn't wired here.
+        has_moves_left = is_v2 && w.tensors.count("moves_left_head.0.weight") > 0;
     }
 
     std::vector<float> trunk(const std::vector<float>& pos) const {
@@ -612,6 +618,42 @@ struct ChesskersNet {
         return (float)((e0 - e2) / (e0 + e1 + e2));
     }
 
+    // Moves-left head off the SHARED value_trunk embedding `emb` (= the d_hidden pos-emb the
+    // value head consumes; model.ChesskersScorerV2: value_head and moves_left_head both take
+    // value_trunk(pool(F))). Sequence: Linear(d_hidden->d_hidden/2) -> LN -> ReLU ->
+    // Linear(->1) -> Softplus. Output = expected plies-to-end (same units as lc0's node M and
+    // the moves_left_target the trainer fits). Split from moves_left_v2 so the GPU backends can
+    // pass the device-computed pos-emb (CUDA d_vt) without recomputing value_trunk.
+    float moves_left_from_embed(const float* emb) const {
+        std::vector<float> m1 = linear_batch(std::vector<float>(emb, emb + d_hidden), 1,
+                                             w.at("moves_left_head.0.weight"),
+                                             w.at("moves_left_head.0.bias"), d_hidden / 2, d_hidden);
+        layernorm_(m1, 1, d_hidden / 2, w.at("moves_left_head.1.weight"),
+                   w.at("moves_left_head.1.bias"));
+        relu_(m1);
+        const auto o = linear_batch(m1, 1, w.at("moves_left_head.3.weight"),
+                                    w.at("moves_left_head.3.bias"), 1, d_hidden / 2);
+        // Softplus (PyTorch default beta=1, threshold=20: linear past 20 to avoid overflow).
+        const double z = o[0];
+        return (float)(z > 20.0 ? z : std::log1p(std::exp(z)));
+    }
+
+    // Moves-left (expected plies to game end) off the spatial map F — the value-head twin:
+    // pool -> value_trunk -> shared pos-emb -> moves_left_from_embed.
+    float moves_left_v2(const std::vector<float>& F) const {
+        std::vector<float> pooled(c_filters);
+        for (int c = 0; c < c_filters; ++c) {
+            double s = 0.0;
+            for (int i = 0; i < 100; ++i) s += F[(size_t)c * 100 + i];
+            pooled[c] = (float)(s / 100.0);
+        }
+        auto vt = linear_batch(pooled, 1, w.at("value_trunk.0.weight"), w.at("value_trunk.0.bias"),
+                               d_hidden, c_filters);
+        layernorm_(vt, 1, d_hidden, w.at("value_trunk.1.weight"), w.at("value_trunk.1.bias"));
+        relu_(vt);
+        return moves_left_from_embed(vt.data());
+    }
+
     // Gather policy head: per move, gather F at from/to/path squares, then
     //   logit = (src_proj(F[from]) . tgt_proj(F[to])) / sqrt(d_hidden)
     //         + ctx_mlp([F[from], F[to], pathmean(F), type_scalars]).
@@ -702,15 +744,20 @@ struct ChesskersNet {
     // falls back to a serial loop (production is V2; not worth the extra batched-trunk path).
     std::vector<std::pair<float, std::vector<float>>> eval_batch(
         const std::vector<std::vector<float>>& positions,
-        const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+        const std::vector<std::vector<std::vector<float>>>& moves_per,
+        std::vector<float>* m_out = nullptr) const {
         const int K = (int)positions.size();
         std::vector<std::pair<float, std::vector<float>>> out(K);
         if (!is_v2) {
             for (int k = 0; k < K; ++k) out[k] = eval(positions[k], moves_per[k]);
-            return out;
+            return out;  // V1: moves-left head not wired (non-production)
         }
         const auto Fs = trunk_v2_batch(positions);
         for (int k = 0; k < K; ++k) out[k] = head_v2(Fs[k], moves_per[k]);
+        if (m_out && has_moves_left) {
+            m_out->resize(K);
+            for (int k = 0; k < K; ++k) (*m_out)[k] = moves_left_v2(Fs[k]);
+        }
         return out;
     }
 };

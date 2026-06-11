@@ -423,20 +423,30 @@ std::vector<std::vector<float>> MetalTrunkV2::run(
 
 std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_batch(
     const std::vector<std::vector<float>>& positions,
-    const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+    const std::vector<std::vector<std::vector<float>>>& moves_per,
+    std::vector<float>* m_out) const {
     const int K = (int)positions.size();
     std::vector<std::pair<float, std::vector<float>>> out(K);
     if (!p_->ok || !p_->net) return out;
-    const auto Fs = run(positions);  // GPU trunk (cached graph)
-    if (p_->heads_ok) return eval_heads_from_F(Fs, moves_per);  // GPU value+policy heads
-    // Fallback (no V2 head graph): CPU value/gather heads.
     const ChesskersNet& net = *p_->net;
-    for (int k = 0; k < K; ++k) {
-        const float v = net.value_v2(Fs[k]);
-        const int N = (int)moves_per[k].size();
-        if (N == 0) { out[k] = {v, std::vector<float>()}; continue; }
-        const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
-        out[k] = {v, softmax_priors(logits.data(), N)};
+    const auto Fs = run(positions);  // GPU trunk (cached graph) -> F downloaded to the host
+    if (p_->heads_ok) {
+        out = eval_heads_from_F(Fs, moves_per);  // GPU value+policy heads
+    } else {
+        // Fallback (no V2 head graph): CPU value/gather heads.
+        for (int k = 0; k < K; ++k) {
+            const float v = net.value_v2(Fs[k]);
+            const int N = (int)moves_per[k].size();
+            if (N == 0) { out[k] = {v, std::vector<float>()}; continue; }
+            const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
+            out[k] = {v, softmax_priors(logits.data(), N)};
+        }
+    }
+    // Moves-left head on the host from the already-downloaded F (the GPU head graph emits only
+    // value+policy; the head is two tiny matmuls). Bit-identical to the CPU oracle.
+    if (m_out && net.has_moves_left) {
+        m_out->resize(K);
+        for (int k = 0; k < K; ++k) (*m_out)[k] = net.moves_left_v2(Fs[k]);
     }
     return out;
 }

@@ -857,24 +857,40 @@ std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_heads_from_F
 
 std::vector<std::pair<float, std::vector<float>>> CudaTrunkV2::eval_batch(
     const std::vector<std::vector<float>>& positions,
-    const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+    const std::vector<std::vector<std::vector<float>>>& moves_per,
+    std::vector<float>* m_out) const {
     const int K = (int)positions.size();
     std::vector<std::pair<float, std::vector<float>>> out(K);
     if (!p_->ok || !p_->net) return out;
+    const ChesskersNet& net = *p_->net;
     if (p_->heads_ok) {
         const int kk = run_device(positions);  // GPU trunk, leaves F in d_x.p
         if (kk == 0) return out;
-        return eval_heads_device(kk, moves_per);  // GPU value + policy heads
+        out = eval_heads_device(kk, moves_per);  // GPU value + policy heads (leaves pos-emb in d_vt)
+        // Moves-left head on the host: reuse the value head's device pos-emb (d_vt = the shared
+        // value_trunk embedding, untouched by the policy head) — a K*d_hidden download, no kernels.
+        if (m_out && net.has_moves_left) {
+            const int dh = p_->d_hidden;
+            std::vector<float> emb((size_t)kk * dh);
+            cuda_check(cudaMemcpy(emb.data(), p_->d_vt.p, (size_t)kk * dh * sizeof(float),
+                                  cudaMemcpyDeviceToHost), "ml embed download");
+            m_out->resize(kk);
+            for (int k = 0; k < kk; ++k) (*m_out)[k] = net.moves_left_from_embed(&emb[(size_t)k * dh]);
+        }
+        return out;
     }
     // Fallback (no V2 heads): GPU trunk + CPU heads.
     const auto Fs = run(positions);
-    const ChesskersNet& net = *p_->net;
     for (int k = 0; k < K; ++k) {
         const float v = net.value_v2(Fs[k]);
         const int N = (int)moves_per[k].size();
         if (N == 0) { out[k] = {v, std::vector<float>()}; continue; }
         const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
         out[k] = {v, softmax_priors(logits.data(), N)};
+    }
+    if (m_out && net.has_moves_left) {
+        m_out->resize(K);
+        for (int k = 0; k < K; ++k) (*m_out)[k] = net.moves_left_v2(Fs[k]);
     }
     return out;
 }

@@ -114,6 +114,41 @@ static void TestBatch(const ChesskersNet& net, Trunk& metal,
   }
 }
 
+// Moves-left head: confirm has_moves_left detection, that eval_batch's m_out is populated on
+// BOTH the CPU oracle and the GPU path, and that the GPU path's m_out is EXACTLY the host
+// moves_left_v2 of the GPU trunk's F (isolates the m_out wiring from trunk float drift — the
+// CPU-vs-GPU absolute values legitimately differ by the same trunk drift the heads see). Also a
+// sanity gate: values must be finite and >= 0 (Softplus output, expected plies-to-end).
+static void TestMovesLeft(const ChesskersNet& net, Trunk& metal,
+                          const std::vector<std::string>& fens) {
+  std::printf("MOVES-LEFT (has_moves_left=%d):\n", net.has_moves_left);
+  if (!net.has_moves_left) { std::printf("  net has no moves-left head; skip\n"); return; }
+  std::vector<std::vector<float>> positions;
+  std::vector<std::vector<std::vector<float>>> moves_per;
+  for (const auto& fen : fens) {
+    Board b = parse_fen(fen);
+    positions.push_back(encode_position_v2(b));
+    std::vector<std::vector<float>> mv;
+    for (const auto& m : gen_legal_native(b)) mv.push_back(encode_native_move(net, m));
+    moves_per.push_back(std::move(mv));
+  }
+  std::vector<float> m_cpu, m_gpu;
+  net.eval_batch(positions, moves_per, &m_cpu);    // CPU trunk + CPU moves-left head
+  metal.eval_batch(positions, moves_per, &m_gpu);  // GPU trunk + host moves-left head
+  auto Fs = metal.run(positions);
+  for (size_t k = 0; k < fens.size(); ++k) {
+    const float ref = net.moves_left_v2(Fs[k]);  // what the GPU path must reproduce exactly
+    const float dwire = (k < m_gpu.size()) ? std::fabs(m_gpu[k] - ref) : 9.9f;
+    const bool finite_pos = k < m_cpu.size() && std::isfinite(m_cpu[k]) && m_cpu[k] >= 0.0f &&
+                            k < m_gpu.size() && std::isfinite(m_gpu[k]) && m_gpu[k] >= 0.0f;
+    const bool wire_ok = dwire < 1e-4f;
+    if (!finite_pos || !wire_ok) ++g_fail;
+    std::printf("  board %zu: ml_cpu=%7.2f ml_gpu=%7.2f wire|d|=%.1e %-3s %-9s  %s\n", k,
+                m_cpu[k], (k < m_gpu.size() ? m_gpu[k] : -1.f), dwire, finite_pos ? "pos" : "BAD",
+                wire_ok ? "wire-OK" : "WIRE-FAIL", fens[k].substr(0, 32).c_str());
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) { std::printf("usage: %s net.bin\n", argv[0]); return 2; }
   ChesskersNet net(argv[1]);
@@ -135,6 +170,7 @@ int main(int argc, char** argv) {
   };
   for (const auto& f : fens) TestFen(net, metal, f);
   TestBatch(net, metal, fens);
+  TestMovesLeft(net, metal, fens);
   std::printf("%s\n", g_fail ? "HEAD PARITY FAIL" : "HEAD PARITY OK");
   return g_fail ? 1 : 0;
 }

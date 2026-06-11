@@ -40,9 +40,13 @@ class CudaTrunkV2 {
     // End-to-end batched eval — GPU trunk + the parity-locked CPU value/gather heads per board.
     // Byte-equivalent to ChesskersNet::eval_batch up to GPU-trunk float error. Returns K
     // (value, priors) pairs. Hold this object to keep the device weights resident across calls.
+    // m_out (optional): if non-null and the net has a moves-left head, filled with K expected
+    // plies-to-end (the lc0 search's node M). Reuses the value head's device pos-emb (d_vt) and
+    // runs the tiny head on the host — no extra GPU kernels.
     std::vector<std::pair<float, std::vector<float>>> eval_batch(
         const std::vector<std::vector<float>>& positions,
-        const std::vector<std::vector<std::vector<float>>>& moves_per) const;
+        const std::vector<std::vector<std::vector<float>>>& moves_per,
+        std::vector<float>* m_out = nullptr) const;
 
     // Run only the value/policy heads on already-computed trunk features Fs (K maps of
     // [c_filters*100]); the back half of eval_batch, exposed so a parity harness can feed the
