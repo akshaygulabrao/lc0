@@ -36,6 +36,7 @@
 #include <sstream>
 #include <thread>
 
+#include "chessckers/apply.hpp"  // cc::node_terminal (Chessckers terminal scoring)
 #include "neural/encoder.h"
 #include "search/classic/node.h"
 #include "utils/fastmath.h"
@@ -1918,7 +1919,7 @@ void SearchWorker::PickNodesToExtendTask(
   }
 }
 
-void SearchWorker::ExtendNode(Node* node, int depth,
+void SearchWorker::ExtendNode(Node* node, int /*depth*/,
                               const std::vector<Move>& moves_to_node,
                               PositionHistory* history) {
   // Initialize position sequence with pre-move position.
@@ -1934,14 +1935,25 @@ void SearchWorker::ExtendNode(Node* node, int depth,
 
   // Check whether it's a draw/lose by position. Importantly, we must check
   // these before doing the by-rule checks below.
-  if (legal_moves.empty()) {
-    // Could be a checkmate or a stalemate
-    if (board.IsUnderCheck()) {
-      node->MakeTerminal(GameResult::WHITE_WON);
-    } else {
+  //
+  // Chessckers terminal detection: we must NOT use the stock chess
+  // checkmate/stalemate test here. Black has no chess "check", a Black tower
+  // left with no legal move is a LOSS (not a stalemate draw), and the rank-8
+  // hold / tower-elimination wins don't empty the move list at all.
+  // cc::node_terminal() returns the result in Node::wl_ frame — the perspective
+  // of the player who just moved into this position (see chessckers/apply.hpp).
+  switch (cc::node_terminal(board.cc(), !legal_moves.empty())) {
+    case cc::NodeTerminal::kWin:
+      node->MakeTerminal(GameResult::WHITE_WON);  // just-moved player won (wl_=+1)
+      return;
+    case cc::NodeTerminal::kLoss:
+      node->MakeTerminal(GameResult::BLACK_WON);  // just-moved player lost (wl_=-1)
+      return;
+    case cc::NodeTerminal::kDraw:
       node->MakeTerminal(GameResult::DRAW);
-    }
-    return;
+      return;
+    case cc::NodeTerminal::kNone:
+      break;
   }
 
   // We can shortcircuit these draws-by-rule only if they aren't root;
@@ -1952,26 +1964,12 @@ void SearchWorker::ExtendNode(Node* node, int depth,
       return;
     }
 
-    if (history->Last().GetRule50Ply() >= 100) {
-      node->MakeTerminal(GameResult::DRAW);
-      return;
-    }
-
-    const auto repetitions = history->Last().GetRepetitions();
-    // Mark two-fold repetitions as draws according to settings.
-    // Depth starts with 1 at root, so number of plies in PV is depth - 1.
-    if (repetitions >= 2) {
-      node->MakeTerminal(GameResult::DRAW);
-      return;
-    } else if (repetitions == 1 && depth - 1 >= 4 &&
-               params_.GetTwoFoldDraws() &&
-               depth - 1 >= history->Last().GetPliesSincePrevRepetition()) {
-      const auto cycle_length = history->Last().GetPliesSincePrevRepetition();
-      // use plies since first repetition as moves left; exact if forced draw.
-      node->MakeTerminal(GameResult::DRAW, (float)cycle_length,
-                         Node::Terminal::TwoFold);
-      return;
-    }
+    // Chessckers has neither a 50-move nor a repetition draw (see position.cc
+    // ComputeGameResult), so the stock FIDE by-rule draws are intentionally
+    // omitted — applying them here would invent draws the variant can't reach.
+    // This matters most in long no-capture endgame conversions, where the
+    // rule50 clock (advanced by White king moves, apply.hpp) climbs to 100 and
+    // would otherwise blind the search with a false draw.
 
     // Neither by-position or by-rule termination, but maybe it's a TB position.
     if (search_->syzygy_tb_ && !search_->root_is_in_dtz_ &&

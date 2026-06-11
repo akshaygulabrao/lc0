@@ -316,4 +316,40 @@ inline Status detect_status(const Board& b) {
     return {"", ""};
 }
 
+// Like detect_status(), but the caller supplies whether the side to move has any
+// legal move — the lc0 search already generated the move list, so this avoids a
+// second scan. Keep the terminal conditions in sync with detect_status() above.
+inline Status detect_status_known(const Board& b, bool has_legal_moves) {
+    if (b.stacks.empty()) return {"variantEnd", "white"};    // Black eliminated
+    if (b.rank8_count >= 3) return {"variantEnd", "white"};  // rank-8 hold (#3)
+    const uint64_t wk_bb = b.kings & b.occupied_white;
+    if (wk_bb == 0) return {"variantEnd", "black"};          // White king captured
+    if (has_legal_moves) return {"", ""};                    // game continues
+    if (b.turn_white) {
+        const int wk_sq = __builtin_ctzll(wk_bb);
+        const bool check =
+            white_in_chessckers_check(b.occupied(), b.occupied_white, wk_sq, b.stacks);
+        return check ? Status{"mate", "black"} : Status{"stalemate", ""};
+    }
+    return {"variantEnd", "white"};  // Black has no legal move -> White wins
+}
+
+// Terminal value of `b` from the perspective of the player who JUST MOVED into
+// it — the frame the lc0 search stores in Node::wl_ (see search/classic/node.h).
+// kWin/kLoss/kDraw mean that player won/lost/drew; kNone means play continues.
+// The search maps kWin -> MakeTerminal(WHITE_WON) (wl_=+1) and kLoss ->
+// BLACK_WON (wl_=-1). Note Black self-eliminating (ramming its own last tower)
+// is a kLoss: White wins the game, but the player who just moved was Black.
+enum class NodeTerminal { kNone, kWin, kLoss, kDraw };
+
+inline NodeTerminal node_terminal(const Board& b, bool has_legal_moves) {
+    const Status st = detect_status_known(b, has_legal_moves);
+    if (st.status.empty()) return NodeTerminal::kNone;
+    if (st.winner.empty()) return NodeTerminal::kDraw;  // White stalemate
+    // The player who just moved is the opposite of the side to move.
+    const bool just_moved_white = !b.turn_white;
+    const bool just_moved_won = (st.winner == "white") == just_moved_white;
+    return just_moved_won ? NodeTerminal::kWin : NodeTerminal::kLoss;
+}
+
 }  // namespace cc

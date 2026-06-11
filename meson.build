@@ -1017,6 +1017,14 @@ endif
 ## Tests
 #############################################################################
 
+# Chessckers-specific terminal-scoring regression test. Header-only and gtest-
+# free on purpose: the stock gtest suite below tests FIDE chess, which this fork
+# does not play, so it is gated off (gtest=false) while this still runs.
+test('CcTerminal',
+  executable('cc_terminal_test', 'src/chessckers/terminal_test.cc',
+             include_directories: includes),
+  timeout: 30)
+
 if get_option('gtest')
   gtest = dependency('gtest', fallback: ['gtest', 'gtest_dep'])
   gmock = dependency('gmock', fallback: ['gtest', 'gmock_dep'])

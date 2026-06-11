@@ -39,6 +39,7 @@
 #include <sstream>
 #include <thread>
 
+#include "chessckers/apply.hpp"  // cc::node_terminal (Chessckers terminal scoring)
 #include "search/dag_classic/node.h"
 #include "utils/fastmath.h"
 #include "utils/random.h"
@@ -2030,14 +2031,23 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   // Check whether it's a draw/lose by position. Importantly, we must check
   // these before doing the by-rule checks below.
   auto node = picked_node.node;
-  if (legal_moves.empty()) {
-    // Could be a checkmate or a stalemate
-    if (board.IsUnderCheck()) {
-      node->MakeTerminal(GameResult::WHITE_WON);
-    } else {
+  // Chessckers terminal detection (mirrors classic search ExtendNode): the stock
+  // chess checkmate/stalemate test is wrong here — Black has no chess "check", a
+  // Black tower with no legal move is a LOSS (not a stalemate draw), and rank-8 /
+  // elimination wins don't empty the move list. cc::node_terminal() returns the
+  // result in Node::wl_ frame (perspective of the player who just moved).
+  switch (cc::node_terminal(board.cc(), !legal_moves.empty())) {
+    case cc::NodeTerminal::kWin:
+      node->MakeTerminal(GameResult::WHITE_WON);  // just-moved player won (wl_=+1)
+      return;
+    case cc::NodeTerminal::kLoss:
+      node->MakeTerminal(GameResult::BLACK_WON);  // just-moved player lost (wl_=-1)
+      return;
+    case cc::NodeTerminal::kDraw:
       node->MakeTerminal(GameResult::DRAW);
-    }
-    return;
+      return;
+    case cc::NodeTerminal::kNone:
+      break;
   }
 
   // We can shortcircuit these draws-by-rule only if they aren't root;
@@ -2048,14 +2058,13 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
       return;
     }
 
-    if (history.Last().GetRule50Ply() >= 100) {
-      node->MakeTerminal(GameResult::DRAW);
-      return;
-    }
-
-    // Handle repetition draws as pseudo-terminals.
+    // Chessckers has no 50-move draw (see position.cc ComputeGameResult); the
+    // stock FIDE rule50 terminal is omitted so the search can't invent a draw
+    // the variant can't reach (long no-capture endgame conversions climb the
+    // rule50 clock to 100). Repetition is likewise not a draw here.
     if (picked_node.repetitions >= 2) {
-      // Not a real terminal, set low node.
+      // Not a real terminal (Chessckers has no repetition draw); the DAG handles
+      // the transposition via the low node below.
     }
     // Neither by-position or by-rule termination, but maybe it's a TB
     // position.
