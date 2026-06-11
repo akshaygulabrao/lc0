@@ -24,6 +24,8 @@
   forward. On Apple with CC_HAVE_METAL the trunk runs on the GPU (~10x/board).
 */
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +53,10 @@ namespace lczero {
 namespace {
 
 using EvalBatchResult = std::vector<std::pair<float, std::vector<float>>>;
+
+// Upper bound on a single fused forward (also reported as maximum_batch_size).
+// The cross-game coalescer never merges past this many positions into one batch.
+constexpr size_t kCoalesceMaxBatch = 1024;
 
 class ChesskersBackend : public Backend {
  public:
@@ -95,7 +101,7 @@ class ChesskersBackend : public Backend {
         // Encourage the search to gather a real minibatch so the batched/GPU
         // trunk pays off (the conv GEMMs fuse across the batch).
         .recommended_batch_size = 256,
-        .maximum_batch_size = 1024,
+        .maximum_batch_size = static_cast<int>(kCoalesceMaxBatch),
     };
   }
 
@@ -154,7 +160,113 @@ class ChesskersBackend : public Backend {
     return net_.eval_batch(positions, moves_per, m_out);
   }
 
+  // Cross-game batch coalescing — the new-Backend-API analog of lc0's
+  // "multiplexing" network (backends/network_mux.cc). Under --parallelism>1 each
+  // self-play game's search thread arrives here with its own small minibatch;
+  // uncoalesced they serialize as N tiny forwards on the GPU lock. Here one
+  // "leader" thread drains ALL currently-queued submissions into a single fused
+  // EvalBatch, so concurrent games share GPU batches. Per-backend-instance, hence
+  // per-net: an arena's two nets use two backends -> two coalescers -> never mix
+  // nets in one batch. With --parallelism=1 the queue is size 1: a passthrough.
+  EvalBatchResult EvalCoalesced(
+      const std::vector<std::vector<float>>& positions,
+      const std::vector<std::vector<std::vector<float>>>& moves_per,
+      std::vector<float>* m_out) const {
+    // CPU BLAS eval is re-entrant and benefits from running concurrently across
+    // search threads (each call can use multi-threaded BLAS); coalescing would
+    // serialize that. Only coalesce on GPU, where the device lock already
+    // serializes forwards so merging into one big batch is a pure win.
+    if (!gpu_enabled()) return EvalBatch(positions, moves_per, m_out);
+
+    CoalesceSub sub{&positions, &moves_per, m_out != nullptr, {}, {}, false};
+
+    std::unique_lock<std::mutex> lk(coalesce_mu_);
+    coalesce_queue_.push_back(&sub);
+    while (!sub.done) {
+      if (coalesce_processing_) {
+        coalesce_cv_.wait(lk);
+        continue;
+      }
+      // Become the leader: drain the queue (capped at the max batch) and run it.
+      coalesce_processing_ = true;
+      std::vector<CoalesceSub*> batch;
+      size_t total = 0;
+      while (!coalesce_queue_.empty()) {
+        CoalesceSub* s = coalesce_queue_.front();
+        const size_t n = s->positions->size();
+        if (!batch.empty() && total + n > kCoalesceMaxBatch) break;
+        batch.push_back(s);
+        total += n;
+        coalesce_queue_.pop_front();
+      }
+      lk.unlock();
+
+      // Merge -> ONE forward -> scatter, OUTSIDE the queue lock so sibling games
+      // keep enqueueing while this batch computes. EvalBatch holds the GPU lock.
+      try {
+        bool want_mlh = false;
+        std::vector<std::vector<float>> merged_pos;
+        std::vector<std::vector<std::vector<float>>> merged_moves;
+        merged_pos.reserve(total);
+        merged_moves.reserve(total);
+        for (CoalesceSub* s : batch) {
+          want_mlh = want_mlh || s->want_mlh;
+          merged_pos.insert(merged_pos.end(), s->positions->begin(),
+                            s->positions->end());
+          merged_moves.insert(merged_moves.end(), s->moves_per->begin(),
+                              s->moves_per->end());
+        }
+        std::vector<float> merged_mls;
+        const EvalBatchResult merged = EvalBatch(
+            merged_pos, merged_moves, want_mlh ? &merged_mls : nullptr);
+        size_t off = 0;
+        for (CoalesceSub* s : batch) {
+          const size_t n = s->positions->size();
+          s->results.assign(merged.begin() + off, merged.begin() + off + n);
+          if (s->want_mlh && merged_mls.size() >= off + n) {
+            s->mls.assign(merged_mls.begin() + off, merged_mls.begin() + off + n);
+          }
+          off += n;
+        }
+      } catch (...) {
+        // Never leave siblings deadlocked on a failed forward: wake them (with
+        // empty results) and re-throw on this thread. A GPU fault here is fatal
+        // anyway; this surfaces it instead of hanging the other games.
+        lk.lock();
+        for (CoalesceSub* s : batch) s->done = true;
+        coalesce_processing_ = false;
+        coalesce_cv_.notify_all();
+        throw;
+      }
+
+      lk.lock();
+      for (CoalesceSub* s : batch) s->done = true;
+      coalesce_processing_ = false;
+      coalesce_cv_.notify_all();
+    }
+
+    if (m_out) *m_out = std::move(sub.mls);
+    return std::move(sub.results);
+  }
+
  private:
+  // One queued evaluation request awaiting coalescing (see EvalCoalesced). The
+  // input pointers alias the caller's stack, valid until done (the caller blocks).
+  struct CoalesceSub {
+    const std::vector<std::vector<float>>* positions;
+    const std::vector<std::vector<std::vector<float>>>* moves_per;
+    bool want_mlh;
+    EvalBatchResult results;
+    std::vector<float> mls;
+    bool done;
+  };
+  // mutable: EvalCoalesced is const (invoked via a const backend ref), like the
+  // GPU mutexes below.
+  mutable std::mutex coalesce_mu_;
+  mutable std::condition_variable coalesce_cv_;
+  mutable std::deque<CoalesceSub*> coalesce_queue_;
+  mutable bool coalesce_processing_ = false;
+
   cc::ChesskersNet net_;
 #ifdef CC_HAVE_METAL
   std::unique_ptr<cc::MetalTrunkV2> metal_;
@@ -208,7 +320,7 @@ class ChesskersComputation : public BackendComputation {
     std::vector<float> mls;
     const bool want_mlh = net.is_v2 && net.has_moves_left;
     const EvalBatchResult results =
-        backend_.EvalBatch(positions, moves_per, want_mlh ? &mls : nullptr);
+        backend_.EvalCoalesced(positions, moves_per, want_mlh ? &mls : nullptr);
 
     for (size_t i = 0; i < k; ++i) {
       const float value = results[i].first;
