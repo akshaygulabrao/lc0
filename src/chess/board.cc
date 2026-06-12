@@ -113,11 +113,13 @@ Square Move::to() const {
 // ChessBoard
 // ---------------------------------------------------------------------------
 
-// Simplified training start: White's 8 pawns + lone king (e1) vs three
-// 2-King Black towers on d6/e6/f6. No opening double-move ({wm} omitted).
+// version_5 endgame: Black 2-King towers on d8 & e8 vs White's lone king (e1),
+// Black to move. A long KK-vs-K win (no longer a 1-move mate) — Black must march
+// the towers down the board and deliver the charge mate, so the net has to LEARN
+// the conversion instead of search solving it in one ply. No opening double-move.
 const char* ChessBoard::kStartposFen =
-    "8/8/3kkk2/8/8/8/PPPPPPPP/4K3"
-    "[d6:kk,e6:kk,f6:kk] w - - 0 1";
+    "3kk3/8/8/8/8/8/8/4K3"
+    "[d8:kk,e8:kk] b - - 0 1";
 const BitBoard ChessBoard::kPawnMask = BitBoard(0);  // unused (no en passant)
 
 void ChessBoard::SetFromFen(std::string_view fen, int* rule50_ply, int* moves) {
