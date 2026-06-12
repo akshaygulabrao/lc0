@@ -1021,6 +1021,7 @@ endif
 # gtest suite below tests FIDE chess, which this fork does not play, so it is
 # gated off (gtest=false) while these still run.
 cc_parity_corpus = meson.project_source_root() / 'src/chessckers/corpus/parity_corpus.jsonl'
+cc_rules_corpus = meson.project_source_root() / 'src/chessckers/corpus/rules_scenarios.jsonl'
 
 test('CcTerminal',
   executable('cc_terminal_test', 'src/chessckers/terminal_test.cc',
@@ -1034,6 +1035,15 @@ test('CcParity',
   executable('cc_parity_test', 'src/chessckers/parity_test.cc',
              include_directories: includes, dependencies: deps),
   args: [cc_parity_corpus], timeout: 120)
+
+# Curated rules-scenario parity (scripts/gen_rules_scenarios.py): the rare rule
+# corners (cadence/rim/off-grid hops, the Mandate, win conditions, promotion,
+# opening double-move) that the random CcParity corpus under-samples, plus an
+# apply-FEN parity check per move. Same deps as CcParity (gen_legal_native).
+test('CcRulesScenarios',
+  executable('cc_rules_scenarios_test', 'src/chessckers/rules_scenarios_test.cc',
+             include_directories: includes, dependencies: deps),
+  args: [cc_rules_corpus], timeout: 60)
 
 test('CcFen',
   executable('cc_fen_test', 'src/chessckers/fen_test.cc',
