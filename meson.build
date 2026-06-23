@@ -136,7 +136,7 @@ common_files += [
   # wrapper are replaced by src/neural/backends/chessckers_backend.cc.
   #   'src/neural/decoder.cc',
   #   'src/neural/encoder.cc',
-  #   'src/neural/wrapper.cc',
+  'src/neural/wrapper.cc',
   'src/neural/factory.cc',
   'src/neural/loader.cc',
   'src/neural/register.cc',

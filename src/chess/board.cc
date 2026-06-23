@@ -118,7 +118,7 @@ Square Move::to() const {
 // the towers down the board and deliver the charge mate, so the net has to LEARN
 // the conversion instead of search solving it in one ply. No opening double-move.
 const char* ChessBoard::kStartposFen =
-    "4k2k/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1";
+    "3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1";
 const BitBoard ChessBoard::kPawnMask = BitBoard(0);  // unused (no en passant)
 
 void ChessBoard::SetFromFen(std::string_view fen, int* rule50_ply, int* moves) {
