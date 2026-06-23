@@ -166,8 +166,11 @@ files += [
   # Chessckers: the legacy Network-wrapping backends, the proto LegacyWeights
   # builder, and the ONNX/XLA converters all assume lc0's fixed-policy proto nets.
   # The chessckers backend (cc:: .bin) replaces them. Excluded:
-  #   network_check/demux/mux/random/record/rr/trivial, network_legacy,
+  #   network_check/demux/mux/random/record/rr/trivial,
   #   onnx/*, xla/*.
+  # network_legacy.cc is kept: network_blas.cc (BLAS backend, still compiled
+  # alongside the cc:: backend) references MultiHeadWeights from it.
+  'src/neural/network_legacy.cc',
   'src/neural/memcache.cc',
   'src/search/classic/params.cc',
   'src/search/classic/search.cc',
