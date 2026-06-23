@@ -22,6 +22,10 @@
 
 namespace cc {
 
+// Tower height cap — the maximum number of pieces (stones + kings) in any
+// Black tower. Matches chessckers_engine.variant_py.state.MAX_TOWER_HEIGHT.
+constexpr int MAX_TOWER_HEIGHT = 5;
+
 // python-chess castling_rights bitmask: bits are the ROOK home squares.
 // a1=0 (Q), h1=7 (K), a8=56 (q), h8=63 (k). Matches state.py::_castling_field.
 constexpr uint64_t BB_A1 = 1ULL << 0;
@@ -279,6 +283,8 @@ inline Board parse_fen(const std::string& fen_in) {
             const size_t c = e.find(':');
             const std::string sqn = (c == std::string::npos) ? e : e.substr(0, c);
             const std::string pieces = (c == std::string::npos) ? "" : e.substr(c + 1);
+            if (pieces.size() > (size_t)MAX_TOWER_HEIGHT)
+                throw std::invalid_argument("tower at " + sqn + " exceeds MAX_TOWER_HEIGHT");
             b.stacks[(uint8_t)parse_square(sqn)] = pieces;
         }
     }

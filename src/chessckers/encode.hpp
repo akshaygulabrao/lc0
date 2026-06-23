@@ -21,20 +21,15 @@ constexpr int ENC_POS_C = 15;
 constexpr int ENC_MOVE_D = 240;
 
 // channels 8-12 for one tower at (x,y) from its pieces (bottom-to-top {s,S,k}).
+// Per-depth encoding: channel 8+d = piece value for stack[d], where s=0.33, S=0.67, k=1.0.
+// Channels beyond height are zero.
 inline void apply_tower_channels(std::vector<float>& out, int x, int y, const std::string& pieces) {
-    const int height = (int)pieces.size();
-    if (height == 0) return;
-    int kings = 0, stones = 0;
-    for (char c : pieces) {
-        if (c == 'k') ++kings;
-        else if (c == 's' || c == 'S') ++stones;
-    }
     const int base = y * 8 + x;
-    out[8 * 64 + base] = static_cast<float>(static_cast<double>(height) / 24.0);
-    out[9 * 64 + base] = static_cast<float>(static_cast<double>(stones) / 24.0);
-    out[10 * 64 + base] = static_cast<float>(static_cast<double>(kings) / 24.0);
-    if (pieces[height - 1] == 's') out[11 * 64 + base] = 1.0f;
-    if (height >= 2 && pieces[height - 2] == 'k') out[12 * 64 + base] = 1.0f;
+    for (int d = 0; d < (int)pieces.size() && d < MAX_TOWER_HEIGHT; ++d) {
+        char p = pieces[d];
+        float v = (p == 'k') ? 1.0f : (p == 'S') ? 2.0f/3.0f : (p == 's') ? 1.0f/3.0f : 0.0f;
+        out[(8 + d) * 64 + base] = v;
+    }
 }
 
 inline std::vector<float> encode_position(const Board& b) {
@@ -103,7 +98,7 @@ inline std::vector<float> encode_move(int from_sq, int to_sq, bool has_capture,
     if (has_deploy) out[130] = 1.0f;
     if (has_demotions) out[131] = 1.0f;
     out[132] = static_cast<float>(static_cast<double>(waypoints.size()) / 8.0);
-    out[133] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 24.0);
+    out[133] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 5.0);
     out[134] = static_cast<float>(static_cast<double>(has_demotions ? demotions_required : 0) / 8.0);
     out[135 + promo_index(promotion)] = 1.0f;
     for (const auto& w : waypoints) {
@@ -148,16 +143,13 @@ inline std::vector<float> encode_position_v2(const Board& b) {
     set_bits(b.pawns & ob, 6);   // Black Stone-top
     set_bits(b.kings & ob, 7);   // Black King-top
     for (const auto& [sq, pieces] : b.stacks) {
-        const int height = (int)pieces.size();
-        if (height == 0) continue;
-        int kings = 0, stones = 0;
-        for (char c : pieces) { if (c == 'k') ++kings; else ++stones; }
+        if (pieces.empty()) continue;
         const int base = sq10_of(sq);
-        out[8 * 100 + base] = static_cast<float>(static_cast<double>(height) / 24.0);
-        out[9 * 100 + base] = static_cast<float>(static_cast<double>(stones) / 24.0);
-        out[10 * 100 + base] = static_cast<float>(static_cast<double>(kings) / 24.0);
-        if (pieces[height - 1] == 's') out[11 * 100 + base] = 1.0f;
-        if (height >= 2 && pieces[height - 2] == 'k') out[12 * 100 + base] = 1.0f;
+        for (int d = 0; d < (int)pieces.size() && d < MAX_TOWER_HEIGHT; ++d) {
+            char p = pieces[d];
+            float v = (p == 'k') ? 1.0f : (p == 'S') ? 2.0f/3.0f : (p == 's') ? 1.0f/3.0f : 0.0f;
+            out[(8 + d) * 100 + base] = v;
+        }
     }
     if (!b.turn_white)
         for (int r = 1; r <= 8; ++r)
@@ -200,7 +192,7 @@ inline std::vector<float> encode_move_v2(int from_sq, int to_sq,
     if (has_deploy) out[s + 2] = 1.0f;
     if (has_demotions) out[s + 3] = 1.0f;
     out[s + 4] = static_cast<float>(static_cast<double>(waypoints.size()) / 8.0);
-    out[s + 5] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 24.0);
+    out[s + 5] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 5.0);
     out[s + 6] = static_cast<float>(static_cast<double>(has_demotions ? demotions_required : 0) / 8.0);
     out[s + 7 + promo_index_v2(promotion)] = 1.0f;
     return out;

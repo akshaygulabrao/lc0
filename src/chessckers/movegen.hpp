@@ -495,9 +495,12 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
                     moves.push_back(build_quiet(from_name, to_sq, top));
                     continue;
                 }
-                if (o == SQ_BLACK && stacks.count((uint8_t)to_sq))  // friendly merge: emit + stop
-                    moves.push_back(build_quiet(from_name, to_sq, top));
-                break;
+                if (o == SQ_BLACK && stacks.count((uint8_t)to_sq)) {  // friendly merge: emit + stop, capped
+                    const auto& existing = stacks.at((uint8_t)to_sq);
+                    if ((int)existing.size() + height <= MAX_TOWER_HEIGHT)
+                        moves.push_back(build_quiet(from_name, to_sq, top));
+                    break;
+                }
             }
         }
         // Sprint: height-1 unmoved Stone-top on rank 8, two squares forward.
@@ -510,7 +513,8 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
                 if (!on_board(tf, tr)) continue;
                 const int to_sq = sq_idx(tf, tr);
                 const int o = owner(occupied, occupied_white, to_sq);
-                if (o == SQ_EMPTY || (o == SQ_BLACK && stacks.count((uint8_t)to_sq)))
+                if (o == SQ_EMPTY || (o == SQ_BLACK && stacks.count((uint8_t)to_sq) &&
+                                       (int)stacks.at((uint8_t)to_sq).size() + 1 <= MAX_TOWER_HEIGHT))
                     moves.push_back(build_quiet(from_name, to_sq, top));
             }
         }
@@ -551,8 +555,11 @@ inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t oc
                         moves.push_back(build_deploy(from_name, to_sq, top, s));
                         continue;
                     }
-                    if (o == SQ_BLACK && stacks.count((uint8_t)to_sq))
-                        moves.push_back(build_deploy(from_name, to_sq, top, s));
+                    if (o == SQ_BLACK && stacks.count((uint8_t)to_sq)) {
+                        const auto& existing = stacks.at((uint8_t)to_sq);
+                        if ((int)existing.size() + s <= MAX_TOWER_HEIGHT)
+                            moves.push_back(build_deploy(from_name, to_sq, top, s));
+                    }
                     break;
                 }
             }
@@ -647,13 +654,14 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
 
                 std::string to_name;
                 bool is_ram = false, is_friendly_merge = false;
+                int landing_sq = -1;
                 std::optional<std::string> rim_landing_key;
                 if (tf >= 0 && tf <= 7 && tr >= 0 && tr <= 7) {
-                    const int s = sq_idx(tf, tr);
-                    to_name = square_name(s);
-                    const int o = owner(occupied, occupied_white, s);
+                    landing_sq = sq_idx(tf, tr);
+                    to_name = square_name(landing_sq);
+                    const int o = owner(occupied, occupied_white, landing_sq);
                     is_ram = (o == SQ_WHITE);
-                    is_friendly_merge = (o == SQ_BLACK && stacks.count((uint8_t)s));
+                    is_friendly_merge = (o == SQ_BLACK && stacks.count((uint8_t)landing_sq));
                 } else {
                     // Rim landing -> fall back to the last on-board square.
                     if (last_on_board_sq < 0) continue;  // d=1 rim: nothing to settle on
@@ -686,6 +694,12 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                         moves.push_back(std::move(m));
                     }
                     continue;
+                }
+
+                // Friendly merge: only emit if combined height fits within cap.
+                if (is_friendly_merge) {
+                    const auto& existing = stacks.at((uint8_t)landing_sq);
+                    if ((int)existing.size() + (int)pieces.size() > MAX_TOWER_HEIGHT) continue;
                 }
 
                 if (n_kings == d) {
