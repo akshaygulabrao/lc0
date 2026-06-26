@@ -579,32 +579,6 @@ struct ChargeMove {
     std::optional<std::vector<int>> source_king_positions;
 };
 
-// In-place r-combinations of `items` (lexicographic). 1:1 with the Rust port —
-// used to enumerate king-demotion choices when n_kings > d.
-inline std::vector<std::vector<int>> combinations(const std::vector<int>& items, int r) {
-    const int n = (int)items.size();
-    if (r == 0 || r > n) return {};
-    std::vector<std::vector<int>> out;
-    std::vector<int> idx(r);
-    for (int i = 0; i < r; ++i) idx[i] = i;
-    while (true) {
-        std::vector<int> combo;
-        combo.reserve(r);
-        for (int i = 0; i < r; ++i) combo.push_back(items[idx[i]]);
-        out.push_back(std::move(combo));
-        int i = r;
-        while (i > 0) {
-            --i;
-            if (idx[i] != i + n - r) break;
-            if (i == 0) return out;
-        }
-        idx[i] += 1;
-        for (int j = i + 1; j < r; ++j) idx[j] = idx[j - 1] + 1;
-        if (idx[0] > n - r) break;
-    }
-    return out;
-}
-
 inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t occupied_white,
                                                   const std::map<uint8_t, std::string>& stacks) {
     std::vector<ChargeMove> moves;
@@ -702,10 +676,17 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                     if ((int)existing.size() + (int)pieces.size() > MAX_TOWER_HEIGHT) continue;
                 }
 
-                if (n_kings == d) {
-                    // Forced demotion (all kings) -> null choice fields.
+                // v6 rule change: a charge of distance d demotes the BOTTOM d
+                // Kings (king_positions[:d]; king_positions is ascending from the
+                // bottom). One move per (from->landing), no {choice} suffix —
+                // removes the old C(n_kings,d) demotion fan-out while preserving
+                // the upper Kings. When n_kings==d this is the old demote-all case.
+                // Mirrors PyVariant black_charge_moves exactly (parity).
+                {
+                    std::vector<int> chosen(king_positions.begin(),
+                                            king_positions.begin() + d);
                     std::string new_pieces = pieces;
-                    for (int pos : king_positions) new_pieces[pos - 1] = 'S';
+                    for (int pos : chosen) new_pieces[pos - 1] = 'S';
                     ChargeMove m;
                     m.uci = from_name + landing_repr;
                     m.from_name = from_name;
@@ -713,25 +694,10 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                     m.piece = (new_pieces.back() == 'k') ? "king" : "pawn";
                     m.capture = capture_field;
                     m.waypoints = charge_waypoints;
+                    m.demoted_kings = chosen;
+                    m.demotions_required = d;
+                    m.source_king_positions = king_positions;
                     moves.push_back(std::move(m));
-                } else {
-                    for (auto& choice : combinations(king_positions, d)) {
-                        std::string new_pieces = pieces;
-                        for (int pos : choice) new_pieces[pos - 1] = 'S';
-                        std::vector<std::string> cs;
-                        for (int i : choice) cs.push_back(std::to_string(i));
-                        ChargeMove m;
-                        m.uci = from_name + landing_repr + "{" + join(cs, ",") + "}";
-                        m.from_name = from_name;
-                        m.to_name = to_name;
-                        m.piece = (new_pieces.back() == 'k') ? "king" : "pawn";
-                        m.capture = capture_field;
-                        m.waypoints = charge_waypoints;
-                        m.demoted_kings = choice;
-                        m.demotions_required = d;
-                        m.source_king_positions = king_positions;
-                        moves.push_back(std::move(m));
-                    }
                 }
 
                 if (is_friendly_merge) stop_after = true;
