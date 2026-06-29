@@ -113,12 +113,12 @@ Square Move::to() const {
 // ChessBoard
 // ---------------------------------------------------------------------------
 
-// version_5 endgame: Black 2-King towers on d8 & e8 vs White's lone king (e1),
-// Black to move. A long KK-vs-K win (no longer a 1-move mate) — Black must march
-// the towers down the board and deliver the charge mate, so the net has to LEARN
-// the conversion instead of search solving it in one ply. No opening double-move.
+// run 9: three Black 2-King towers on d6/e6/f6 vs White's full pawn wall (rank 2)
+// + lone king on e1, White to move. An UNKNOWN-ANSWER position — unlike e8/d8 we
+// do not know if Black can force the win; the pawn wall is a real obstacle the
+// towers must break. No opening double-move.
 const char* ChessBoard::kStartposFen =
-    "3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1";
+    "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w - - 0 1";
 const BitBoard ChessBoard::kPawnMask = BitBoard(0);  // unused (no en passant)
 
 void ChessBoard::SetFromFen(std::string_view fen, int* rule50_ply, int* moves) {
