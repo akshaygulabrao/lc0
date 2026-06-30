@@ -501,6 +501,7 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
                         moves.push_back(build_quiet(from_name, to_sq, top));
                     break;
                 }
+                break;  // White piece (or any non-friendly): blocks the slide; no quiet landing past it.
             }
         }
         // Sprint: height-1 unmoved Stone-top on rank 8, two squares forward.
