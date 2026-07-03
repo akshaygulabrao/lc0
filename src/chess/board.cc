@@ -113,10 +113,11 @@ Square Move::to() const {
 // ChessBoard
 // ---------------------------------------------------------------------------
 
-// run 10: the OFFICIAL full Chessckers starting position — full FIDE chess (ranks
-// 1-2) vs Black's 24 towers (ranks 6-8: Stones on 6 & 8 + a7/h7, Kings on b7-g7),
-// White to move with the opening DOUBLE-MOVE ({wm:2}). The first run on the complete
-// game; warm-started from run 9's d6/e6/f6 net. Mirrors PyVariant STARTING_FEN.
+// run 14: the OFFICIAL full Chessckers starting position (= PyVariant STARTING_FEN) —
+// full FIDE White (RNBQKBNR + pawns) vs Black's 24 towers (ranks 6-8: Stones on 6 & 8 +
+// a7/h7, Kings on b7-g7), White to move with the opening DOUBLE-MOVE ({wm:2}); 20 legal
+// opening moves. The curriculum graduates back to the complete game; warm-started from
+// run 13's c64/b6 army-vs-d6e6f6 net. Identical start position to run 10.
 const char* ChessBoard::kStartposFen =
     "pppppppp/pkkkkkkp/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
     "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
