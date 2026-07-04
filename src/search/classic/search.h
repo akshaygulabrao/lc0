@@ -163,6 +163,14 @@ class Search {
   SyzygyTablebase* syzygy_tb_;
   // Fixed positions which happened before the search.
   const PositionHistory& played_history_;
+  // Chessckers: true when the root is a {wm:2} opening-double-move position,
+  // i.e. the root's children are SAME-mover edges (White->White). The backup
+  // negation assumes strict alternation, so under this flag the root's
+  // children carry their values in the ROOT's own (opponent-of-White) frame
+  // and every root-boundary read/write of a child Q/WL must flip sign once.
+  // wm=2 exists only at game ply 0, so no deeper node is ever affected.
+  // Mirrors PyVariant mcts_puct._child_q_from (the rules oracle's semantics).
+  bool root_same_mover_children_ = false;
 
   Backend* const backend_;
   BackendAttributes backend_attributes_;

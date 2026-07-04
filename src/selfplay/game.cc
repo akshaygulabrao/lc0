@@ -255,7 +255,15 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
         }
         if (edge.GetMove(tree_[idx]->IsBlackToMove()) == move) {
           cur_n = edge.GetN();
-          played_eval.wl = edge.GetWL(-node->GetWL());
+          // {wm:2} root (opening double-move): children store WL in the
+          // root's own frame — flip visited edges to the root-mover frame
+          // (matches the classic-search root-boundary convention).
+          const bool same_mover_root =
+              tree_[idx]->GetPositionHistory().Last().GetBoard().cc()
+                  .white_moves_left == 2;
+          played_eval.wl = (same_mover_root && edge.GetN() > 0)
+                               ? -edge.GetWL(0.0f)
+                               : edge.GetWL(-node->GetWL());
           played_eval.d = edge.GetD(node->GetD());
           played_eval.ml = edge.GetM(node->GetM() - 1) + 1;
         }

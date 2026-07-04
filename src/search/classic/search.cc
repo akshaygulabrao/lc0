@@ -172,6 +172,10 @@ Search::Search(const NodeTree& tree, Backend* backend,
           searchmoves_, syzygy_tb_, played_history_,
           params_.GetSyzygyFastPlay(), &tb_hits_, &root_is_in_dtz_)),
       uci_responder_(std::move(uci_responder)) {
+  // Chessckers {wm:2}: at the opening double-move root the children are
+  // same-mover edges; see the root_same_mover_children_ declaration.
+  root_same_mover_children_ =
+      played_history_.Last().GetBoard().cc().white_moves_left == 2;
   if (params_.GetMaxConcurrentSearchers() != 0) {
     pending_searchers_.store(params_.GetMaxConcurrentSearchers(),
                              std::memory_order_release);
@@ -296,7 +300,12 @@ void Search::SendUciInfo() REQUIRES(nodes_mutex_) REQUIRES(counters_mutex_) {
     ++multipv;
     uci_infos.emplace_back(common_info);
     auto& uci_info = uci_infos.back();
-    auto wl = edge.GetWL(default_wl);
+    // {wm:2} root: visited children store WL in the root's own frame — flip
+    // to the root-mover frame for display (unvisited fall back to default_wl,
+    // which is already root-mover).
+    auto wl = (root_same_mover_children_ && edge.GetN() > 0)
+                  ? -edge.GetWL(0.0f)
+                  : edge.GetWL(default_wl);
     auto d = edge.GetD(default_d);
     float mu_uci = 0.0f;
     if (score_type == "WDL_mu" || (params_.GetWDLRescaleDiff() != 0.0f &&
@@ -428,22 +437,27 @@ float Search::GetDrawScore(bool is_odd_depth) const {
 }
 
 namespace {
+// `children_share_frame`: Chessckers {wm:2} same-mover root — the children's
+// stored values share the node's own frame, so the parent-Q seed for FPU must
+// NOT be negated (see Search::root_same_mover_children_).
 inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_node,
-                    float draw_score) {
+                    float draw_score, bool children_share_frame = false) {
   const auto value = params.GetFpuValue(is_root_node);
-  return params.GetFpuAbsolute(is_root_node)
-             ? value
-             : -node->GetQ(-draw_score) -
-                   value * std::sqrt(node->GetVisitedPolicy());
+  if (params.GetFpuAbsolute(is_root_node)) return value;
+  const float parent_q = children_share_frame ? node->GetQ(draw_score)
+                                              : -node->GetQ(-draw_score);
+  return parent_q - value * std::sqrt(node->GetVisitedPolicy());
 }
 
 // Faster version for if visited_policy is readily available already.
 inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_node,
-                    float draw_score, float visited_pol) {
+                    float draw_score, float visited_pol,
+                    bool children_share_frame = false) {
   const auto value = params.GetFpuValue(is_root_node);
-  return params.GetFpuAbsolute(is_root_node)
-             ? value
-             : -node->GetQ(-draw_score) - value * std::sqrt(visited_pol);
+  if (params.GetFpuAbsolute(is_root_node)) return value;
+  const float parent_q = children_share_frame ? node->GetQ(draw_score)
+                                              : -node->GetQ(-draw_score);
+  return parent_q - value * std::sqrt(visited_pol);
 }
 
 inline float ComputeCpuct(const SearchParams& params, uint32_t N,
@@ -659,8 +673,11 @@ Eval Search::GetBestEval(Move* move, bool* is_terminal) const {
   EdgeAndNode best_edge = GetBestChildNoTemperature(root_node_, 0);
   if (move) *move = best_edge.GetMove(played_history_.IsBlackToMove());
   if (is_terminal) *is_terminal = best_edge.IsTerminal();
-  return {best_edge.GetWL(parent_wl), best_edge.GetD(parent_d),
-          best_edge.GetM(parent_m - 1) + 1};
+  // {wm:2} root: a visited child's stored WL is in the root's own frame.
+  const float best_wl = (root_same_mover_children_ && best_edge.GetN() > 0)
+                            ? -best_edge.GetWL(0.0f)
+                            : best_edge.GetWL(parent_wl);
+  return {best_wl, best_edge.GetD(parent_d), best_edge.GetM(parent_m - 1) + 1};
 }
 
 std::pair<Move, Move> Search::GetBestMove() {
@@ -751,9 +768,14 @@ std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
   const auto middle = (static_cast<int>(edges.size()) > count)
                           ? edges.begin() + count
                           : edges.end();
+  // {wm:2} root: children store WL/Q in the root's own frame — flip once so
+  // the ranking below judges them from the root mover's perspective (this was
+  // THE bug that made ply-0 anti-optimize White's first sub-move).
+  const float qsign =
+      (parent == root_node_ && root_same_mover_children_) ? -1.0f : 1.0f;
   std::partial_sort(
       edges.begin(), middle, edges.end(),
-      [draw_score](const auto& a, const auto& b) {
+      [draw_score, qsign](const auto& a, const auto& b) {
         // The function returns "true" when a is preferred to b.
 
         // Lists edge types from less desirable to more desirable.
@@ -765,10 +787,10 @@ std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
           kTerminalWin,
         };
 
-        auto GetEdgeRank = [](const EdgeAndNode& edge) {
+        auto GetEdgeRank = [qsign](const EdgeAndNode& edge) {
           // This default isn't used as wl only checked for case edge is
           // terminal.
-          const auto wl = edge.GetWL(0.0f);
+          const auto wl = qsign * edge.GetWL(0.0f);
           // Not safe to access IsTerminal if GetN is 0.
           if (edge.GetN() == 0 || !edge.IsTerminal() || !wl) {
             return kNonTerminal;
@@ -804,7 +826,8 @@ std::vector<EdgeAndNode> Search::GetBestChildrenNoTemperature(Node* parent,
           // both are N==0 (thus we're comparing equal defaults) or N!=0 and
           // default isn't used.
           if (a.GetQ(0.0f, draw_score) != b.GetQ(0.0f, draw_score)) {
-            return a.GetQ(0.0f, draw_score) > b.GetQ(0.0f, draw_score);
+            return qsign * a.GetQ(0.0f, draw_score) >
+                   qsign * b.GetQ(0.0f, draw_score);
           }
           return a.GetP() > b.GetP();
         }
@@ -841,8 +864,11 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
   float max_n = 0.0;
   const float offset = params_.GetTemperatureVisitOffset();
   float max_eval = -1.0f;
-  const float fpu =
-      GetFpu(params_, root_node_, /* is_root= */ true, draw_score);
+  const float fpu = GetFpu(params_, root_node_, /* is_root= */ true, draw_score,
+                           root_same_mover_children_);
+  // {wm:2} root: child Q values are stored in the root's own frame; flip once
+  // so the winpct cutoff compares root-mover evals.
+  const float qsign = root_same_mover_children_ ? -1.0f : 1.0f;
 
   for (auto& edge : root_node_->Edges()) {
     if (!root_move_filter_.empty() &&
@@ -852,7 +878,9 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
     }
     if (edge.GetN() + offset > max_n) {
       max_n = edge.GetN() + offset;
-      max_eval = edge.GetQ(fpu, draw_score);
+      // fpu is in the children's stored frame, so it is the right GetQ
+      // default; only the result is flipped to the root-mover frame.
+      max_eval = qsign * edge.GetQ(fpu, draw_score);
     }
   }
 
@@ -865,7 +893,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
                   edge.GetMove()) == root_move_filter_.end()) {
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
+    if (qsign * edge.GetQ(fpu, draw_score) < min_eval) continue;
     sum += std::pow(
         std::max(0.0f,
                  (max_n <= 0.0f
@@ -887,7 +915,7 @@ EdgeAndNode Search::GetBestRootChildWithTemperature(float temperature) const {
                   edge.GetMove()) == root_move_filter_.end()) {
       continue;
     }
-    if (edge.GetQ(fpu, draw_score) < min_eval) continue;
+    if (qsign * edge.GetQ(fpu, draw_score) < min_eval) continue;
     if (idx-- == 0) return edge;
   }
   assert(false);
@@ -953,8 +981,11 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
   // If root node hasn't finished first visit, none of this code is safe.
   if (root_node_->GetN() > 0) {
     const auto draw_score = GetDrawScore(true);
-    const float fpu =
-        GetFpu(params_, root_node_, /* is_root_node */ true, draw_score);
+    const float fpu = GetFpu(params_, root_node_, /* is_root_node */ true,
+                             draw_score, root_same_mover_children_);
+    // {wm:2} root: children store Q/WL in the root's own frame — flip once so
+    // win/loss detection and time management see root-mover evals.
+    const float qsign = root_same_mover_children_ ? -1.0f : 1.0f;
     float max_q_plus_m = -1000;
     uint64_t max_n = 0;
     bool max_n_has_max_q_plus_m = true;
@@ -963,17 +994,17 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
                                  : MEvaluator();
     for (const auto& edge : root_node_->Edges()) {
       const auto n = edge.GetN();
-      const auto q = edge.GetQ(fpu, draw_score);
+      const auto q = qsign * edge.GetQ(fpu, draw_score);
       const auto m = m_evaluator.GetMUtility(edge, q);
       const auto q_plus_m = q + m;
       stats->edge_n.push_back(n);
-      if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) > 0.0f) {
+      if (n > 0 && edge.IsTerminal() && qsign * edge.GetWL(0.0f) > 0.0f) {
         stats->win_found = true;
       }
-      if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) < 0.0f) {
+      if (n > 0 && edge.IsTerminal() && qsign * edge.GetWL(0.0f) < 0.0f) {
         stats->num_losing_edges += 1;
       }
-      if (n > 0 && edge.IsTerminal() && edge.GetWL(0.0f) == 1.0f &&
+      if (n > 0 && edge.IsTerminal() && qsign * edge.GetWL(0.0f) == 1.0f &&
           !edge.IsTbTerminal()) {
         stats->mate_depth =
             std::min(stats->mate_depth,
@@ -1702,10 +1733,17 @@ void SearchWorker::PickNodesToExtendTask(
                                    : even_draw_score;
       m_evaluator.SetParent(node);
       float visited_pol = 0.0f;
+      // {wm:2} root: children store Q in the root's own frame, but PUCT
+      // selection scores must be in the root-MOVER's frame — flip visited
+      // children once. The standard FPU (-parent Q) is already root-mover
+      // frame here, so it stays as-is. This was the anti-optimization bug.
+      const bool same_mover_root =
+          is_root_node && search_->root_same_mover_children_;
       for (Node* child : node->VisitedNodes()) {
         int index = child->Index();
         visited_pol += current_pol[index];
-        float q = child->GetQ(draw_score);
+        float q = same_mover_root ? -child->GetQ(-draw_score)
+                                  : child->GetQ(draw_score);
         current_util[index] = q + m_evaluator.GetMUtility(child, q);
       }
       const float fpu =
@@ -2268,9 +2306,15 @@ void SearchWorker::DoBackupUpdateSingleNode(
         update_parent_bounds && p != search_->root_node_ && !p->IsTerminal() &&
         MaybeSetBounds(p, m, &n_to_fix, &v_delta, &d_delta, &m_delta);
 
-    // Q will be flipped for opponent.
-    v = -v;
-    v_delta = -v_delta;
+    // Q will be flipped for opponent — EXCEPT into a {wm:2} root: its children
+    // are same-mover edges (opening double-move), and by convention they store
+    // values in the root's own frame, so the hop into the root keeps the sign.
+    // This keeps root_q (= -root WL) correct at ply 0 and matches PyVariant's
+    // mcts_puct._child_q_from semantics.
+    if (!(search_->root_same_mover_children_ && p == search_->root_node_)) {
+      v = -v;
+      v_delta = -v_delta;
+    }
     m++;
 
     // Update the stats.
