@@ -299,6 +299,17 @@ inline std::string encode_chunk(const PureGame& game) {
             json_double(o, static_cast<double>(rec.visits[k]) / static_cast<double>(total));
         }
         o += ']';
+        // Gumbel improved-policy target (aligned with legal_moves); omitted when
+        // not computed → trainer falls back to visit_distribution above.
+        if (!rec.improved_policy.empty()) {
+            j.key("improved_policy");
+            o += '[';
+            for (size_t k = 0; k < rec.improved_policy.size(); ++k) {
+                if (k) o += ',';
+                json_double(o, static_cast<double>(rec.improved_policy[k]));
+            }
+            o += ']';
+        }
         const std::vector<double>& wdl = rec.side_white ? wdl_white : wdl_black;
         j.key("wdl_target");
         o += '[';

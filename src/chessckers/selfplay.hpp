@@ -37,6 +37,10 @@ struct PureRecord {
     std::string fen;
     std::vector<NativeMove> legal;
     std::vector<int> visits;  // aligned with `legal`
+    // Gumbel AlphaZero improved-policy target softmax(log P + sigma(completedQ)),
+    // aligned with `legal`; empty = not computed → encode omits it and the trainer
+    // falls back to the visit distribution. See game.cc for the computation.
+    std::vector<float> improved_policy;
     bool side_white;
     // Search root value (STM-relative) for value-target bootstrapping; NaN = this
     // self-play path recorded none → encode emits search_wdl:null (trainer falls

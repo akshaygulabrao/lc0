@@ -28,7 +28,9 @@
 #include "selfplay/game.h"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
 
 #include "chessckers/chunk.hpp"         // cc::encode_chunk (ccz1 gzipped JSON)
 #include "chessckers/native_move.hpp"   // cc::NativeMove
@@ -302,9 +304,69 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       // Mirrors lc0 V6 root_q/root_d (trainingdata.cc): q = -GetWL(), d = GetD().
       rec.root_q = -node->GetWL();
       rec.root_d = node->GetD();
+      // Gather per-move visits, priors P, and child Q (root-mover POV: a child's
+      // GetWL is already in the parent's-mover frame in lc0 — same frame as
+      // rec.root_q above), for both the visit distribution and the Gumbel target.
+      // Exception: at a {wm:2} root (opening double-move) visited children store
+      // WL in the root's own frame (root-boundary convention of the wm2 fix in
+      // classic search), so flip them into the root-mover frame here too.
+      const bool same_mover_root =
+          tree_[idx]->GetPositionHistory().Last().GetBoard().cc()
+              .white_moves_left == 2;
+      std::vector<float> prior, cq;  // aligned with rec.legal
+      double sum_vn = 0.0, sum_vp = 0.0, wq = 0.0;  // Σ N, Σ P, Σ P·Q over VISITED
+      int max_n = 0;
       for (const auto& edge : node->Edges()) {
         rec.legal.push_back(*edge.GetMove(false).native());
-        rec.visits.push_back(static_cast<int>(edge.GetN()));
+        const int n = static_cast<int>(edge.GetN());
+        rec.visits.push_back(n);
+        const float p = edge.GetP();
+        // root-mover POV; only used when n>0.
+        const float q =
+            same_mover_root ? -edge.GetWL(0.0f) : edge.GetWL(0.0f);
+        prior.push_back(p);
+        cq.push_back(q);
+        if (n > 0) {
+          sum_vn += n;
+          sum_vp += p;
+          wq += p * q;
+          max_n = std::max(max_n, n);
+        }
+      }
+      // Gumbel AlphaZero improved policy: softmax(log P + σ(completedQ)), the
+      // policy-improvement target (Danihelka et al. 2022; mctx
+      // qtransform_completed_by_mix_value). completedQ takes each visited child's
+      // Q, and for unvisited children the v_mix completion (root value blended
+      // with the visit-weighted, prior-reweighted Q of visited children). σ scales
+      // by (c_visit + max_child_visits) · c_scale over the min-max normalized Q.
+      constexpr float kGumbelCVisit = 50.0f;
+      constexpr float kGumbelCScale = 1.0f;
+      const double v_mix = (sum_vp > 0.0)
+          ? (rec.root_q + sum_vn * (wq / sum_vp)) / (1.0 + sum_vn)
+          : rec.root_q;
+      for (size_t k = 0; k < cq.size(); ++k) {
+        if (rec.visits[k] == 0) cq[k] = static_cast<float>(v_mix);
+      }
+      float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+      for (float q : cq) { lo = std::min(lo, q); hi = std::max(hi, q); }
+      const float rng = hi - lo;
+      const float sig = (kGumbelCVisit + static_cast<float>(max_n)) * kGumbelCScale;
+      double zsum = 0.0;
+      float smax = -std::numeric_limits<float>::infinity();
+      std::vector<float> logit(cq.size());
+      for (size_t k = 0; k < cq.size(); ++k) {
+        const float qn = (rng > 1e-8f) ? (cq[k] - lo) / rng : 0.5f;
+        logit[k] = std::log(std::max(prior[k], 1e-9f)) + sig * qn;
+        smax = std::max(smax, logit[k]);
+      }
+      rec.improved_policy.resize(cq.size());
+      for (size_t k = 0; k < cq.size(); ++k) {
+        const double e = std::exp(logit[k] - smax);
+        rec.improved_policy[k] = static_cast<float>(e);
+        zsum += e;
+      }
+      if (zsum > 0.0) {
+        for (float& p : rec.improved_policy) p = static_cast<float>(p / zsum);
       }
       cc_data_->game.records.push_back(std::move(rec));
     }
