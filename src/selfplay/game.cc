@@ -167,6 +167,12 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       break;
     }
     // Initialize search.
+    // Chessckers: derive the mover from the POSITION every iteration instead of
+    // toggling per ply — the {wm:2} opening double-move breaks strict
+    // alternation once, and a toggle stays desynced from ply 1 on, routing
+    // every move to the WRONG player's engine (two-player matches/tournaments
+    // then credit results to the wrong net; see run-17 postmortem).
+    blacks_move = tree_[0]->IsBlackToMove();
     const int idx = blacks_move ? 1 : 0;
     if (!options_[idx].uci_options->Get<bool>(kReuseTreeId)) {
       tree_[idx]->TrimTreeAtHead();
@@ -315,7 +321,6 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     if (tree_[0]->IsBlackToMove()) move.Flip();
     tree_[0]->MakeMove(move);
     if (tree_[0] != tree_[1]) tree_[1]->MakeMove(move);
-    blacks_move = !blacks_move;
   }
 }
 
