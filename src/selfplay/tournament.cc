@@ -28,6 +28,7 @@
 #include "selfplay/tournament.h"
 
 #include <fstream>
+#include <sstream>
 
 #include "chess/pgn.h"
 #include "neural/memcache.h"
@@ -97,6 +98,14 @@ const OptionId kSyzygyTablebaseId{
     "List of Syzygy tablebase directories, list entries separated by system "
     "separator (\";\" for Windows, \":\" for Linux).",
     's'};
+const OptionId kLeagueWeightsId{
+    "league-weights", "LeagueWeights",
+    "Comma-separated list of past-champion weights files. Each training game "
+    "replaces player2's net with one of these (sampled uniformly per game) "
+    "with probability --league-fraction."};
+const OptionId kLeagueFractionId{
+    "league-fraction", "LeagueFraction",
+    "Fraction of games played against a league opponent."};
 
 }  // namespace
 
@@ -136,6 +145,8 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<ChoiceOption>(kOpeningsModeId, openings_modes) = "sequential";
 
   options->Add<StringOption>(kSyzygyTablebaseId);
+  options->Add<StringOption>(kLeagueWeightsId) = "";
+  options->Add<FloatOption>(kLeagueFractionId, 0.0f, 1.0f) = 0.0f;
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -177,7 +188,8 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
       kValueGamesSize(options.Get<int>(kValueModeSizeId)),
       kTournamentResultsFile(
           options.Get<std::string>(kTournamentResultsFileId)),
-      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)) {
+      kDiscardedStartChance(options.Get<float>(kDiscardedStartChanceId)),
+      kLeagueFraction(options.Get<float>(kLeagueFractionId)) {
   multi_games_size_ = std::max(kPolicyGamesSize, kValueGamesSize);
   std::string book = options.Get<std::string>(kOpeningsFileId);
   if (!book.empty()) {
@@ -232,6 +244,39 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
                            options.GetSubdict(name));
         backend_list.emplace_back(backends_[name_idx][color_idx]);
       }
+    }
+  }
+
+  // League: load past-champion backends for per-game opponent sampling.
+  // Each pool net inherits player2's (white) resolved options, overriding
+  // only the weights path.
+  const std::string league_weights =
+      options.Get<std::string>(kLeagueWeightsId);
+  if (!league_weights.empty()) {
+    std::istringstream ss(league_weights);
+    std::string path;
+    while (std::getline(ss, path, ',')) {
+      if (path.empty()) continue;
+      auto dict = std::make_unique<OptionsDict>(&player_options_[1][0]);
+      dict->Set<std::string>(SharedBackendParams::kWeightsId, path);
+      std::shared_ptr<Backend> backend;
+      for (const auto& existing : backend_list) {
+        if (existing->IsSameConfiguration(*dict)) {
+          backend = existing;
+          break;
+        }
+      }
+      if (!backend) {
+        backend = CreateMemCache(BackendManager::Get()->CreateFromParams(*dict),
+                                 options.GetSubdict("player2"));
+        backend_list.emplace_back(backend);
+      }
+      league_backends_.push_back(std::move(backend));
+      league_backend_options_.push_back(std::move(dict));
+    }
+    if (!league_backends_.empty()) {
+      CERR << "League: " << league_backends_.size()
+           << " opponent net(s), fraction " << kLeagueFraction;
     }
   }
 
@@ -298,6 +343,13 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
       discard_pile_.pop_back();
     }
   }
+  // League: with probability kLeagueFraction, player2 plays this game as a
+  // uniformly sampled past champion. -1 = normal self-play game.
+  int league_idx = -1;
+  if (!league_backends_.empty() &&
+      Random::Get().GetFloat(1.0f) < kLeagueFraction) {
+    league_idx = Random::Get().GetInt(0, league_backends_.size() - 1);
+  }
   const int color_idx[2] = {player1_black ? 1 : 0, player1_black ? 0 : 1};
 
   PlayerOptions options[2];
@@ -312,6 +364,8 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     // Populate per-player options.
     PlayerOptions& opt = options[color_idx[pl_idx]];
     opt.backend = backends_[pl_idx][color].get();
+    if (league_idx >= 0 && pl_idx == 1)
+      opt.backend = league_backends_[league_idx].get();
     opt.uci_options = &player_options_[pl_idx][color];
     opt.search_limits = search_limits_[pl_idx][color];
 
@@ -376,8 +430,9 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
   SyzygyTablebase* syzygy_tb;
   {
     Mutex::Lock lock(mutex_);
-    games_.emplace_front(std::make_unique<SelfPlayGame>(options[0], options[1],
-                                                        kShareTree, opening));
+    // Different-net players must not share a search tree.
+    games_.emplace_front(std::make_unique<SelfPlayGame>(
+        options[0], options[1], kShareTree && league_idx < 0, opening));
     game_iter = games_.begin();
     syzygy_tb = syzygy_tb_.get();
   }
@@ -400,6 +455,7 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     game_info.game_result = game.GetGameResult();
     game_info.is_black = player1_black;
     game_info.game_id = game_number;
+    game_info.league_opponent_idx = league_idx;
     game_info.initial_fen = opening.start_fen;
     game_info.moves = game.GetMoves();
     game_info.play_start_ply = game.GetStartPly();
