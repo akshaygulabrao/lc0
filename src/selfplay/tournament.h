@@ -103,6 +103,9 @@ class SelfPlayTournament {
   // dicts declared first so they outlive the backends).
   std::vector<std::unique_ptr<OptionsDict>> league_backend_options_;
   std::vector<std::shared_ptr<Backend>> league_backends_;
+  // PFSP sampling probabilities aligned with league_backends_ (normalized;
+  // empty = uniform sampling).
+  std::vector<float> league_probs_;
 
   UciResponder* uci_responder_;
   GameInfo::Callback game_callback_;

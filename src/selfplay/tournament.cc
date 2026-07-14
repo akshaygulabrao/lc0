@@ -101,11 +101,17 @@ const OptionId kSyzygyTablebaseId{
 const OptionId kLeagueWeightsId{
     "league-weights", "LeagueWeights",
     "Comma-separated list of past-champion weights files. Each training game "
-    "replaces player2's net with one of these (sampled uniformly per game) "
-    "with probability --league-fraction."};
+    "replaces player2's net with one of these (sampled per game — uniformly, "
+    "or per --league-probs) with probability --league-fraction."};
 const OptionId kLeagueFractionId{
     "league-fraction", "LeagueFraction",
     "Fraction of games played against a league opponent."};
+const OptionId kLeagueProbsId{
+    "league-probs", "LeagueProbs",
+    "Comma-separated sampling probabilities for the --league-weights nets "
+    "(PFSP — the server computes them from live per-opponent win rates). "
+    "Count must match --league-weights; values are normalized internally. "
+    "Empty = uniform."};
 
 }  // namespace
 
@@ -147,6 +153,7 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<StringOption>(kSyzygyTablebaseId);
   options->Add<StringOption>(kLeagueWeightsId) = "";
   options->Add<FloatOption>(kLeagueFractionId, 0.0f, 1.0f) = 0.0f;
+  options->Add<StringOption>(kLeagueProbsId) = "";
   SelfPlayGame::PopulateUciParams(options);
 
   auto defaults = options->GetMutableDefaultsOptions();
@@ -280,6 +287,39 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
     }
   }
 
+  // League PFSP: optional server-computed sampling probabilities over the
+  // pool (from live per-opponent win rates). Empty = uniform sampling.
+  const std::string league_probs = options.Get<std::string>(kLeagueProbsId);
+  if (!league_probs.empty()) {
+    if (league_backends_.empty()) {
+      throw Exception("--league-probs requires --league-weights.");
+    }
+    std::istringstream ps(league_probs);
+    std::string tok;
+    float sum = 0.0f;
+    while (std::getline(ps, tok, ',')) {
+      if (tok.empty()) continue;
+      float w = 0.0f;
+      try {
+        w = std::stof(tok);
+      } catch (const std::exception&) {
+        throw Exception("--league-probs: bad value '" + tok + "'.");
+      }
+      if (w < 0.0f) throw Exception("--league-probs: negative value.");
+      league_probs_.push_back(w);
+      sum += w;
+    }
+    if (league_probs_.size() != league_backends_.size()) {
+      throw Exception(
+          "--league-probs count (" + std::to_string(league_probs_.size()) +
+          ") must match --league-weights count (" +
+          std::to_string(league_backends_.size()) + ").");
+    }
+    if (sum <= 0.0f) throw Exception("--league-probs must sum to > 0.");
+    for (auto& w : league_probs_) w /= sum;
+    CERR << "League: PFSP sampling probs " << league_probs;
+  }
+
   // SearchLimits.
   for (int name_idx : {0, 1}) {
     for (int color_idx : {0, 1}) {
@@ -344,11 +384,26 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
     }
   }
   // League: with probability kLeagueFraction, player2 plays this game as a
-  // uniformly sampled past champion. -1 = normal self-play game.
+  // past champion sampled from the pool — PFSP-weighted when --league-probs
+  // was given, else uniformly. -1 = normal self-play game.
   int league_idx = -1;
   if (!league_backends_.empty() &&
       Random::Get().GetFloat(1.0f) < kLeagueFraction) {
-    league_idx = Random::Get().GetInt(0, league_backends_.size() - 1);
+    if (league_probs_.empty()) {
+      league_idx = Random::Get().GetInt(0, league_backends_.size() - 1);
+    } else {
+      // Inverse-CDF sample; probs are normalized at parse time. Falling
+      // through the loop (fp residue) picks the last net.
+      float r = Random::Get().GetFloat(1.0f);
+      league_idx = static_cast<int>(league_backends_.size()) - 1;
+      for (size_t i = 0; i < league_probs_.size(); ++i) {
+        r -= league_probs_[i];
+        if (r < 0.0f) {
+          league_idx = static_cast<int>(i);
+          break;
+        }
+      }
+    }
   }
   const int color_idx[2] = {player1_black ? 1 : 0, player1_black ? 0 : 1};
 
