@@ -44,6 +44,13 @@
 namespace lczero {
 namespace classic {
 
+// Hard cap on edges (legal moves) per node. Chess never exceeds 218, but
+// Chessckers positions regularly exceed 255 (tall King-tower deploy/charge
+// fans; 700+ in constructed extremes), so the search scratch buffers sized by
+// this must comfortably exceed anything reachable. Node::CreateEdges clamps
+// (with a warning) rather than let a wider position overflow those buffers.
+inline constexpr int kMaxNumEdges = 1024;
+
 // Children of a node are stored the following way:
 // * Edges and Nodes edges point to are stored separately.
 // * There may be dangling edges (which don't yet point to any Node object yet)

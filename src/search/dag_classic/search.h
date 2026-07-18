@@ -401,12 +401,12 @@ class SearchWorker {
   // variable. Packed value stores required visit information which can be
   // pushed into the current_path stack.
   struct CurrentPath {
-    uint32_t visits_ : 20;       // <= collision limit
+    uint32_t visits_ : 18;       // <= collision limit
     uint32_t large_branch_ : 1;  // bool
     uint32_t last_child_ : 1;    // bool
     uint32_t visit_child_ : 1;   // bool
     uint32_t stop_picking_ : 1;  // bool
-    uint32_t index_ : 8;         // < 218
+    uint32_t index_ : 10;        // < kMaxNumEdges (Chessckers exceeds 218/255)
     CurrentPath(unsigned visits, bool last, bool visit, bool stop,
                 unsigned index)
         : visits_(visits),
@@ -439,10 +439,12 @@ class SearchWorker {
 
   static_assert(sizeof(CurrentPath) == sizeof(uint32_t),
                 "CurrentPath must be packed into 32 bits");
+  static_assert(kMaxNumEdges <= (1 << 10),
+                "CurrentPath::index_ must be able to hold any edge index");
 
   // Holds per task worker scratch data
   struct TaskWorkspace {
-    std::array<Node::Iterator, 256> cur_iters;
+    std::array<Node::Iterator, kMaxNumEdges> cur_iters;
     std::vector<CurrentPath> current_path;
     BackupPath full_path;
     TaskWorkspace() {
