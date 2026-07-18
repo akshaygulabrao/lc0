@@ -40,6 +40,7 @@
 #include "neural/backend.h"
 #include "neural/register.h"
 #include "neural/shared_params.h"
+#include "utils/atomic_vector.h"
 #include "utils/logging.h"
 
 #ifdef CC_HAVE_METAL
@@ -281,18 +282,22 @@ class ChesskersBackend : public Backend {
 class ChesskersComputation : public BackendComputation {
  public:
   explicit ChesskersComputation(const ChesskersBackend& backend)
-      : backend_(backend) {}
+      : backend_(backend), items_(kCoalesceMaxBatch) {}
 
   size_t UsedBatchSize() const override { return items_.size(); }
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
+    // Called CONCURRENTLY by the classic search's task workers (ProcessPickedTask
+    // fans leaf-picking across threads on GPU backends), so the container must be
+    // an AtomicVector like upstream's NetworkAsBackendComputation — a plain
+    // vector push_back here segfaults under multi-threaded gathering.
     Item item;
     // Chessckers encoding uses only the current board (no chess history planes).
     item.board = pos.pos.back().GetBoard();
     item.moves.assign(pos.legal_moves.begin(), pos.legal_moves.end());
     item.out = result;
-    items_.push_back(std::move(item));
+    items_.emplace_back(std::move(item));
     return ENQUEUED_FOR_EVAL;
   }
 
@@ -342,7 +347,9 @@ class ChesskersComputation : public BackendComputation {
     EvalResultPtr out;
   };
   const ChesskersBackend& backend_;
-  std::vector<Item> items_;
+  // Capacity = kCoalesceMaxBatch = the advertised maximum_batch_size: the search
+  // never gathers more inputs than that into one computation.
+  AtomicVector<Item> items_;
 };
 
 std::unique_ptr<BackendComputation> ChesskersBackend::CreateComputation() {
