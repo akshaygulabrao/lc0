@@ -345,8 +345,10 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       // Q, and for unvisited children the v_mix completion (root value blended
       // with the visit-weighted, prior-reweighted Q of visited children). σ scales
       // by (c_visit + max_child_visits) · c_scale over the min-max normalized Q.
+      // c_visit=50, c_scale=0.1 per the mctx reference defaults — run 15 showed
+      // c_scale=1 one-hots the target onto Q-noise (run-16 banked requirement).
       constexpr float kGumbelCVisit = 50.0f;
-      constexpr float kGumbelCScale = 1.0f;
+      constexpr float kGumbelCScale = 0.1f;
       const double v_mix = (sum_vp > 0.0)
           ? (rec.root_q + sum_vn * (wq / sum_vp)) / (1.0 + sum_vn)
           : rec.root_q;
