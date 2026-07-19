@@ -51,6 +51,11 @@
 namespace lczero {
 namespace dag_classic {
 
+// Hard cap on edges (legal moves) per node — see classic/node.h. Chessckers
+// positions can exceed 255 legal moves; search scratch buffers (and the
+// CurrentPath packed index) are sized by this. LowNode clamps on creation.
+inline constexpr int kMaxNumEdges = 1024;
+
 // Terminology:
 // * Edge - a potential edge with a move and policy information.
 // * Node - an existing edge with number of visits and evaluation.
@@ -313,7 +318,7 @@ class Node {
   bool IsTbTerminal() const { return terminal_type_ == Terminal::Tablebase; }
   Bounds GetBounds() const { return {lower_bound_, upper_bound_}; }
 
-  uint8_t GetNumEdges() const;
+  uint16_t GetNumEdges() const;
 
   // Makes the node terminal and sets it's score.
   void MakeTerminal(GameResult result, float plies_left = 1.0f,
@@ -502,7 +507,7 @@ class LowNode {
   }
   // Init @edges_ with moves from @moves and 0 policy.
   LowNode(const MoveList& moves)
-      : num_edges_(moves.size()),
+      : num_edges_(std::min<size_t>(moves.size(), kMaxNumEdges)),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
         upper_bound_(GameResult::WHITE_WON) {
@@ -511,7 +516,7 @@ class LowNode {
   // Init @edges_ with moves from @moves and 0 policy.
   // Also create the first child at @index.
   LowNode(const MoveList& moves, uint16_t index)
-      : num_edges_(moves.size()),
+      : num_edges_(std::min<size_t>(moves.size(), kMaxNumEdges)),
         terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
         upper_bound_(GameResult::WHITE_WON) {
@@ -555,7 +560,7 @@ class LowNode {
   Bounds GetBounds() const { return {lower_bound_, upper_bound_}; }
   Terminal GetTerminalType() const { return terminal_type_; }
 
-  uint8_t GetNumEdges() const { return num_edges_; }
+  uint16_t GetNumEdges() const { return num_edges_; }
   // Gets pointer to the start of the edge array.
   Edge* GetEdges() const { return edges_.get(); }
 
@@ -653,9 +658,11 @@ class LowNode {
   // Number of parents.
   std::atomic<uint16_t> num_parents_ = {};
 
+  // Number of edges in @edges_. 16-bit: Chessckers positions can exceed 255
+  // legal moves (see classic/node.h), which a uint8_t silently truncated.
+  uint16_t num_edges_ = 0;
+
   // 1 byte fields.
-  // Number of edges in @edges_.
-  uint8_t num_edges_ = 0;
   // Bit fields using parts of uint8_t fields initialized in the constructor.
   // Whether or not this node end game (with a winning of either sides or draw).
   Terminal terminal_type_ : 2;

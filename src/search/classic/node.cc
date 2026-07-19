@@ -39,6 +39,7 @@
 #include "neural/network.h"
 #include "utils/exception.h"
 #include "utils/hashcat.h"
+#include "utils/logging.h"
 
 namespace lczero {
 namespace classic {
@@ -205,6 +206,17 @@ Node* Node::CreateSingleChildNode(Move move) {
 void Node::CreateEdges(const MoveList& moves) {
   assert(!edges_);
   assert(!child_);
+  if (moves.size() > static_cast<size_t>(kMaxNumEdges)) {
+    // Search scratch buffers are sized by kMaxNumEdges; a wider position must
+    // degrade (search a subset) rather than overflow them. Loud so any real
+    // occurrence is investigable — PyVariant remains the rules authority.
+    CERR << "Warning: " << moves.size() << " legal moves exceeds kMaxNumEdges="
+         << kMaxNumEdges << "; clamping (some moves unsearchable)";
+    MoveList clamped(moves.begin(), moves.begin() + kMaxNumEdges);
+    edges_ = Edge::FromMovelist(clamped);
+    num_edges_ = kMaxNumEdges;
+    return;
+  }
   edges_ = Edge::FromMovelist(moves);
   num_edges_ = moves.size();
 }

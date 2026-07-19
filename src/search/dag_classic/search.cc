@@ -1683,11 +1683,11 @@ void SearchWorker::PickNodesToExtendTask(
   }
 
   // This 1 is 'filled pre-emptively'.
-  std::array<float, 256> current_util;
+  std::array<float, kMaxNumEdges> current_util;
 
   // These 3 are 'filled on demand'.
-  std::array<float, 256> current_score;
-  std::array<int, 256> current_nstarted;
+  std::array<float, kMaxNumEdges> current_score;
+  std::array<int, kMaxNumEdges> current_nstarted;
   auto& cur_iters = workspace->cur_iters;
 
   Node::Iterator best_edge;

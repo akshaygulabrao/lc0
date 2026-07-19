@@ -98,6 +98,14 @@ class SelfPlayTournament {
   std::shared_ptr<Backend> backends_[2][2];
   const OptionsDict player_options_[2][2];
   SelfPlayLimits search_limits_[2][2];
+  // League opponent backends + the OptionsDicts they were created from (kept
+  // alive: backends/memcaches may hold references into their creation dict;
+  // dicts declared first so they outlive the backends).
+  std::vector<std::unique_ptr<OptionsDict>> league_backend_options_;
+  std::vector<std::shared_ptr<Backend>> league_backends_;
+  // PFSP sampling probabilities aligned with league_backends_ (normalized;
+  // empty = uniform sampling).
+  std::vector<float> league_probs_;
 
   UciResponder* uci_responder_;
   GameInfo::Callback game_callback_;
@@ -112,6 +120,7 @@ class SelfPlayTournament {
   int multi_games_size_;
   const std::string kTournamentResultsFile;
   const float kDiscardedStartChance;
+  const float kLeagueFraction;
 };
 
 }  // namespace lczero

@@ -115,6 +115,9 @@ struct GameInfo {
   int play_start_ply;
   // Index of the game in the tournament (0-based).
   int game_id = -1;
+  // League: index of the opponent in the --league-weights list, or -1 for a
+  // normal self-play game.
+  int league_opponent_idx = -1;
   // The color of the player1, if known.
   std::optional<bool> is_black;
   // Minimum resign threshold which would have resulted in a false positive

@@ -266,7 +266,7 @@ void LowNode::SetBounds(GameResult lower, GameResult upper) {
   upper_bound_ = upper;
 }
 
-uint8_t Node::GetNumEdges() const {
+uint16_t Node::GetNumEdges() const {
   return low_node_ ? low_node_->GetNumEdges() : 0;
 }
 

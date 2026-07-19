@@ -1627,12 +1627,12 @@ void SearchWorker::PickNodesToExtendTask(
   }
 
   // These 2 are 'filled pre-emptively'.
-  std::array<float, 256> current_pol;
-  std::array<float, 256> current_util;
+  std::array<float, kMaxNumEdges> current_pol;
+  std::array<float, kMaxNumEdges> current_util;
 
   // These 3 are 'filled on demand'.
-  std::array<float, 256> current_score;
-  std::array<int, 256> current_nstarted;
+  std::array<float, kMaxNumEdges> current_score;
+  std::array<int, kMaxNumEdges> current_nstarted;
   auto& cur_iters = workspace->cur_iters;
 
   Node::Iterator best_edge;
@@ -1703,7 +1703,8 @@ void SearchWorker::PickNodesToExtendTask(
         visits_to_perform.push_back(std::move(vtp_buffer.back()));
         vtp_buffer.pop_back();
       } else {
-        visits_to_perform.push_back(std::make_unique<std::array<int, 256>>());
+        visits_to_perform.push_back(
+            std::make_unique<std::array<int, kMaxNumEdges>>());
       }
       vtp_last_filled.push_back(-1);
 
