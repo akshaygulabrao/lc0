@@ -60,6 +60,14 @@ struct PlayerOptions {
   const OptionsDict* uci_options;
   // Limits to use for every move.
   SelfPlayLimits search_limits;
+  // Playout-cap randomization: probability that a move gets a full search.
+  // Other moves search under pcr_fast_limits with pcr_fast_uci_options
+  // (noise off, temperature 0) and emit no training record. 1 = off.
+  float pcr_full_prob = 1.0f;
+  // Limits for playout-cap-randomization fast searches (--pcr-fast-visits).
+  SelfPlayLimits pcr_fast_limits;
+  // Options override for fast searches; owned by the tournament.
+  const OptionsDict* pcr_fast_uci_options = nullptr;
 };
 
 // Chessckers training-data collector (pimpl; keeps the cc:: engine headers out

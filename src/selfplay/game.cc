@@ -176,15 +176,31 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     // then credit results to the wrong net; see run-17 postmortem).
     blacks_move = tree_[0]->IsBlackToMove();
     const int idx = blacks_move ? 1 : 0;
+    // Playout-cap randomization (KataGo): draw per move whether this is a
+    // FULL search (the configured visits, noise + temperature, a training
+    // record) or a FAST one (--pcr-fast-visits cap, no noise, argmax
+    // selection, no record). prob >= 1 short-circuits the RNG draw, so the
+    // default (PCR off) path is byte-identical to before.
+    const float pcr_full_prob = options_[idx].pcr_full_prob;
+    const bool full_search =
+        pcr_full_prob >= 1.0f || Random::Get().GetFloat(1.0f) < pcr_full_prob;
     if (!options_[idx].uci_options->Get<bool>(kReuseTreeId)) {
       tree_[idx]->TrimTreeAtHead();
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (abort_) break;
-      auto stoppers = options_[idx].search_limits.MakeSearchStopper();
-      classic::PopulateIntrinsicStoppers(stoppers.get(),
-                                         *options_[idx].uci_options);
+      // Fast moves search under the fast limits/options: visits capped at
+      // --pcr-fast-visits, noise-epsilon 0, temperature 0 (-> argmax in
+      // GetBestMove()). Everything else falls through to the player's dict.
+      const SelfPlayLimits& limits = full_search
+                                         ? options_[idx].search_limits
+                                         : options_[idx].pcr_fast_limits;
+      const OptionsDict& search_options =
+          full_search ? *options_[idx].uci_options
+                      : *options_[idx].pcr_fast_uci_options;
+      auto stoppers = limits.MakeSearchStopper();
+      classic::PopulateIntrinsicStoppers(stoppers.get(), search_options);
 
       std::unique_ptr<UciResponder> responder =
           std::make_unique<CallbackUciResponder>(
@@ -194,7 +210,7 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
           *tree_[idx], options_[idx].backend, std::move(responder),
           /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
           std::move(stoppers), /* infinite */ false, /* ponder */ false,
-          *options_[idx].uci_options, syzygy_tb);
+          search_options, syzygy_tb);
     }
 
     // Do search.
@@ -296,15 +312,19 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       search_->ResetBestMove();
     }
 
-    if (training) {
+    if (training && full_search) {
       // Chessckers training data: record the search root's per-move visit counts
       // as a cc::chunk PureRecord. lc0's V6 training_data_.Add is intentionally
       // skipped here -- it runs through the stubbed chess encoder (empty planes,
       // which would crash) and is replaced by the cc::chunk written in
       // WriteTrainingData(). node == tree_[idx]->GetCurrentHead() (searched root).
+      // PCR fast moves skip this block entirely: no record, no Gumbel readout.
       cc::PureRecord rec;
       rec.fen = BoardToFen(tree_[idx]->GetPositionHistory().Last().GetBoard());
       rec.side_white = !tree_[idx]->IsBlackToMove();
+      // Stamp the true game ply (records are SPARSE under PCR — fast moves
+      // emit none) so encode_chunk computes real plies-to-end for moves_left.
+      rec.ply = cc_data_->game.total_plies;
       // Lever 3: record the searched root's value (STM-relative WDL) so the trainer
       // can bootstrap the value target from search q, not only the noisy outcome z.
       // Mirrors lc0 V6 root_q/root_d (trainingdata.cc): q = -GetWL(), d = GetD().
@@ -385,6 +405,9 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
     if (tree_[0]->IsBlackToMove()) move.Flip();
     tree_[0]->MakeMove(move);
     if (tree_[0] != tree_[1]) tree_[1]->MakeMove(move);
+    // Count every played ply, including PCR fast moves that emitted no
+    // record, so WriteTrainingData's encode sees true plies-to-end.
+    if (training) ++cc_data_->game.total_plies;
   }
 }
 

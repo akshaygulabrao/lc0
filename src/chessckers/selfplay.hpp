@@ -47,12 +47,21 @@ struct PureRecord {
     // back to the game outcome z). Set only where a full WDL is available.
     float root_q = NAN;  // -node->GetWL()  (>0: STM winning)
     float root_d = NAN;  // node->GetD()    (draw probability)
+    // Game ply this record was taken at (plies already played when the search
+    // ran). -1 = the writer didn't stamp plies (dense-records legacy paths) →
+    // encode_chunk falls back to counting records for moves_left.
+    int ply = -1;
 };
 
 struct PureGame {
     std::vector<PureRecord> records;
     std::string outcome;        // "white" / "black" / "draw"
     std::string final_status;   // "" == None (resigned/maxplies games)
+    // Total plies actually played. Set by writers that stamp PureRecord::ply
+    // (lc0-fork self-play, where playout-cap randomization makes records
+    // SPARSE — fast moves emit none); 0 = unknown → encode_chunk falls back
+    // to the dense records-are-plies count.
+    int total_plies = 0;
 };
 
 // ---- leaf evaluator indirection (Phase 6d: GPU leaf batching) ----

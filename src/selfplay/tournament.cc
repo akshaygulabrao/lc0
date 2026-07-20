@@ -58,6 +58,15 @@ const OptionId kPlayoutsId{"playouts", "Playouts",
                            "Number of playouts per move to search."};
 const OptionId kVisitsId{"visits", "Visits",
                          "Number of visits per move to search."};
+const OptionId kPcrFullProbId{
+    "pcr-full-prob", "PcrFullProb",
+    "Playout-cap randomization (KataGo): probability that a move gets a FULL "
+    "search (the configured visits, Dirichlet noise, temperature, and a "
+    "training record). Other moves get a fast --pcr-fast-visits search with "
+    "noise off, argmax move selection, and no training record. 1 = off."};
+const OptionId kPcrFastVisitsId{
+    "pcr-fast-visits", "PcrFastVisits",
+    "Number of visits per move for playout-cap-randomization fast searches."};
 const OptionId kTimeMsId{"movetime", "MoveTime",
                          "Time per move, in milliseconds."};
 const OptionId kTrainingId{
@@ -135,6 +144,8 @@ void SelfPlayTournament::PopulateOptions(OptionsParser* options) {
   options->Add<IntOption>(kParallelGamesId, 1, 256) = 8;
   options->Add<IntOption>(kPlayoutsId, -1, 999999999) = -1;
   options->Add<IntOption>(kVisitsId, -1, 999999999) = -1;
+  options->Add<FloatOption>(kPcrFullProbId, 0.0f, 1.0f) = 1.0f;
+  options->Add<IntOption>(kPcrFastVisitsId, 1, 999999999) = 100;
   options->Add<IntOption>(kTimeMsId, -1, 999999999) = -1;
   options->Add<BoolOption>(kTrainingId) = false;
   options->Add<BoolOption>(kVerboseThinkingId) = false;
@@ -345,6 +356,35 @@ SelfPlayTournament::SelfPlayTournament(const OptionsDict& options,
     }
   }
 
+  // Playout-cap randomization: per-player full-search probability, the
+  // visit-capped limits for fast searches, and the fast-search options
+  // override (noise off, temperature 0 -> argmax). At the default
+  // --pcr-full-prob=1 every move is a full search and none of this is used.
+  for (int name_idx : {0, 1}) {
+    for (int color_idx : {0, 1}) {
+      const auto& dict = options.GetSubdict(kPlayerNames[name_idx])
+                             .GetSubdict(kPlayerColors[color_idx]);
+      const float full_prob = dict.Get<float>(kPcrFullProbId);
+      const int fast_visits = dict.Get<int>(kPcrFastVisitsId);
+      if (full_prob <= 0.0f || full_prob > 1.0f) {
+        throw Exception("--pcr-full-prob must be in (0, 1].");
+      }
+      if (fast_visits < 1) {
+        throw Exception("--pcr-fast-visits must be >= 1.");
+      }
+      pcr_full_prob_[name_idx][color_idx] = full_prob;
+      pcr_fast_limits_[name_idx][color_idx] =
+          search_limits_[name_idx][color_idx];
+      pcr_fast_limits_[name_idx][color_idx].visits = fast_visits;
+      auto fast = std::make_unique<OptionsDict>(
+          &player_options_[name_idx][color_idx]);
+      fast->Set<float>(classic::SearchParams::kNoiseEpsilonId, 0.0f);
+      fast->Set<float>(classic::SearchParams::kTemperatureId, 0.0f);
+      fast->Set<float>(classic::SearchParams::kTemperatureEndgameId, 0.0f);
+      pcr_fast_options_[name_idx][color_idx] = std::move(fast);
+    }
+  }
+
   // Take syzygy tablebases from options.
   std::string tb_paths = options.Get<std::string>(kSyzygyTablebaseId);
   if (!tb_paths.empty()) {
@@ -423,6 +463,9 @@ void SelfPlayTournament::PlayOneGame(int game_number) {
       opt.backend = league_backends_[league_idx].get();
     opt.uci_options = &player_options_[pl_idx][color];
     opt.search_limits = search_limits_[pl_idx][color];
+    opt.pcr_full_prob = pcr_full_prob_[pl_idx][color];
+    opt.pcr_fast_limits = pcr_fast_limits_[pl_idx][color];
+    opt.pcr_fast_uci_options = pcr_fast_options_[pl_idx][color].get();
 
     // "bestmove" callback.
     opt.best_move_callback = [this, game_number, pl_idx, player1_black,

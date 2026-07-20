@@ -98,6 +98,13 @@ class SelfPlayTournament {
   std::shared_ptr<Backend> backends_[2][2];
   const OptionsDict player_options_[2][2];
   SelfPlayLimits search_limits_[2][2];
+  // Playout-cap randomization (--pcr-full-prob / --pcr-fast-visits): the
+  // probability a move gets a full search, the visit-capped limits for fast
+  // searches, and the fast-search options override (noise off, temperature 0;
+  // child dicts of player_options_). Owned here; games hold pointers.
+  float pcr_full_prob_[2][2];
+  SelfPlayLimits pcr_fast_limits_[2][2];
+  std::unique_ptr<OptionsDict> pcr_fast_options_[2][2];
   // League opponent backends + the OptionsDicts they were created from (kept
   // alive: backends/memcaches may hold references into their creation dict;
   // dicts declared first so they outlive the backends).

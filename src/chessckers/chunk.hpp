@@ -336,7 +336,18 @@ inline std::string encode_chunk(const PureGame& game) {
             json_double(o, l);
             o += ']';
         }
-        j.d("moves_left_target", static_cast<double>(n - i));
+        // moves_left: plies from this position to game end. Use the stamped
+        // per-record ply when present (records may be SPARSE under playout-cap
+        // randomization — fast moves emit none); fall back to the dense
+        // records-are-plies count for legacy writers. Identical values when
+        // records are dense (ply == i, total_plies == n).
+        const double moves_left = (rec.ply >= 0 && game.total_plies > 0)
+                                      ? static_cast<double>(game.total_plies - rec.ply)
+                                      : static_cast<double>(n - i);
+        j.d("moves_left_target", moves_left);
+        // Serialize ply so Python tooling can classify PCR gaps without FEN heuristics.
+        // Omit when ply is -1 (legacy / unset writers keep the old compact format).
+        if (rec.ply >= 0) j.i("ply", rec.ply);
         j.end();
     }
     o += "]}";
