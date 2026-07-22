@@ -177,4 +177,23 @@ inline std::vector<NativeMove> gen_legal_native(const Board& b) {
     return out;
 }
 
+// FNV-1a over the legal-move uci strings (uci uniquely encodes a move incl. the
+// full chain path, so this pins both identity AND order). Used by the
+// PureRecord::legal drop/regenerate cycle: game.cc stamps it when it drops the
+// fat move list after recording, encode_chunk verifies it after regenerating
+// from the FEN — a mismatch aborts loudly instead of silently emitting policy
+// rows misaligned with legal_moves.
+inline uint64_t legal_ucis_hash(const std::vector<NativeMove>& legal) {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& m : legal) {
+        for (const char c : m.uci) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+        h ^= 0xffu;  // move separator
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 }  // namespace cc

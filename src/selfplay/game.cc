@@ -396,6 +396,35 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
       if (zsum > 0.0) {
         for (float& p : rec.improved_policy) p = static_cast<float>(p / zsum);
       }
+      // Canonicalize the record to uci-lexicographic order, then DROP the fat
+      // move list: holding every ply's full NativeMove list (uci + waypoint
+      // strings, thousands of chain moves on shuffle positions) leaked ~10MB per
+      // move over 450-ply games — the 2026-07-22 OOM livelock. encode_chunk
+      // regenerates the list from rec.fen at write time, re-sorts it the same
+      // way, and verifies this hash. Canonical order is needed because edge
+      // order here is NOT movegen order (lc0 sorts edges by prior); all chunk
+      // consumers pair legal_moves[i] with the aligned targets and are
+      // order-agnostic (train_az per-example pairing, watch_game argmax/lookup).
+      {
+        std::vector<size_t> perm(rec.legal.size());
+        for (size_t k = 0; k < perm.size(); ++k) perm[k] = k;
+        std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) {
+          return rec.legal[a].uci < rec.legal[b].uci;
+        });
+        std::vector<cc::NativeMove> legal_s(perm.size());
+        std::vector<int> visits_s(perm.size());
+        std::vector<float> policy_s(perm.size());
+        for (size_t k = 0; k < perm.size(); ++k) {
+          legal_s[k] = std::move(rec.legal[perm[k]]);
+          visits_s[k] = rec.visits[perm[k]];
+          policy_s[k] = rec.improved_policy[perm[k]];
+        }
+        rec.visits = std::move(visits_s);
+        rec.improved_policy = std::move(policy_s);
+        rec.legal_hash = cc::legal_ucis_hash(legal_s);
+        rec.legal.clear();
+        rec.legal.shrink_to_fit();
+      }
       cc_data_->game.records.push_back(std::move(rec));
     }
     // Must reset the search before mutating the tree.

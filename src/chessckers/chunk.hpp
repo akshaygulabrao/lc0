@@ -16,6 +16,7 @@
 // position/move/target tensors as az_game_to_examples of the equivalent game.
 // Floats are emitted at 17 significant digits so json.loads recovers the exact
 // same IEEE-754 double C++ computed (v/total is deterministic across both).
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -279,14 +280,37 @@ inline std::string encode_chunk(const PureGame& game) {
     const int n = static_cast<int>(game.records.size());
     for (int i = 0; i < n; ++i) {
         const PureRecord& rec = game.records[i];
+        // Writers that drop `legal` after recording (game.cc, to bound per-game
+        // memory) stamp legal_hash; regenerate the move list from the FEN here
+        // and VERIFY it. Same movegen, same order — a mismatch means the policy
+        // rows below would be misaligned with legal_moves, so die loudly.
+        std::vector<NativeMove> regen;
+        const std::vector<NativeMove>* legal = &rec.legal;
+        if (rec.legal.empty() && !rec.visits.empty()) {
+            regen = gen_legal_native(parse_fen(rec.fen));
+            std::sort(regen.begin(), regen.end(),
+                      [](const NativeMove& a, const NativeMove& b) {
+                          return a.uci < b.uci;
+                      });
+            if (regen.size() != rec.visits.size() ||
+                legal_ucis_hash(regen) != rec.legal_hash) {
+                std::fprintf(stderr,
+                             "encode_chunk: regenerated legal moves diverge from "
+                             "recorded (fen=%s regen=%zu visits=%zu) — aborting "
+                             "to avoid misaligned policy rows\n",
+                             rec.fen.c_str(), regen.size(), rec.visits.size());
+                std::abort();
+            }
+            legal = &regen;
+        }
         if (i) o += ',';
         JsonObj j(o);
         j.s("fen", rec.fen);
         j.key("legal_moves");
         o += '[';
-        for (size_t k = 0; k < rec.legal.size(); ++k) {
+        for (size_t k = 0; k < legal->size(); ++k) {
             if (k) o += ',';
-            native_move_json(o, rec.legal[k]);
+            native_move_json(o, (*legal)[k]);
         }
         o += ']';
         long total = 0;

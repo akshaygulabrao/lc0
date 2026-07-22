@@ -51,6 +51,12 @@ struct PureRecord {
     // ran). -1 = the writer didn't stamp plies (dense-records legacy paths) →
     // encode_chunk falls back to counting records for moves_left.
     int ply = -1;
+    // legal_ucis_hash of `legal` as recorded, stamped by writers that DROP the
+    // move list after recording (a 450-ply game holding every ply's full
+    // NativeMove list — waypoint strings and all — was the 2026-07-22 ~10MB/move
+    // OOM livelock). 0 = `legal` was kept (legacy dense writers/tests).
+    // encode_chunk regenerates from `fen` and verifies against this.
+    uint64_t legal_hash = 0;
 };
 
 struct PureGame {
