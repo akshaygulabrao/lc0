@@ -1053,6 +1053,11 @@ test('CcFen',
              include_directories: includes),
   args: [cc_parity_corpus], timeout: 60)
 
+# Not a test: deterministic ccz1 chunk-JSON dumper for refactor byte-parity
+# (diff its output across a rules/emission refactor). Needs deps like CcParity.
+executable('cc_chunk_dump', 'src/chessckers/chunk_dump.cc',
+           include_directories: includes, dependencies: deps)
+
 if get_option('gtest')
   gtest = dependency('gtest', fallback: ['gtest', 'gtest_dep'])
   gmock = dependency('gmock', fallback: ['gtest', 'gmock_dep'])

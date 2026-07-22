@@ -23,7 +23,7 @@ constexpr int ENC_MOVE_D = 240;
 // channels 8-12 for one tower at (x,y) from its pieces (bottom-to-top {s,S,k}).
 // Per-depth encoding: channel 8+d = piece value for stack[d], where s=0.33, S=0.67, k=1.0.
 // Channels beyond height are zero.
-inline void apply_tower_channels(std::vector<float>& out, int x, int y, const std::string& pieces) {
+inline void apply_tower_channels(std::vector<float>& out, int x, int y, const Tower& pieces) {
     const int base = y * 8 + x;
     for (int d = 0; d < (int)pieces.size() && d < MAX_TOWER_HEIGHT; ++d) {
         char p = pieces[d];

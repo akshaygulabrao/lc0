@@ -15,7 +15,6 @@
 
 #include <cctype>
 #include <cstdint>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +24,112 @@ namespace cc {
 // Tower height cap — the maximum number of pieces (stones + kings) in any
 // Black tower. Matches chessckers_engine.variant_py.state.MAX_TOWER_HEIGHT.
 constexpr int MAX_TOWER_HEIGHT = 5;
+
+// POD tower: inline fixed-capacity string of 's'/'S'/'k' (bottom-to-top),
+// replacing std::string as StackMap's mapped type. API mirrors the std::string
+// subset the rules code uses so call sites stay unchanged.
+struct Tower {
+    uint8_t n = 0;
+    char c[MAX_TOWER_HEIGHT] = {};
+    Tower() = default;
+    Tower(const char* s) { while (*s) push_back(*s++); }
+    Tower(const std::string& s) { for (char ch : s) push_back(ch); }
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    char back() const { return c[n - 1]; }
+    char operator[](size_t i) const { return c[i]; }
+    char& operator[](size_t i) { return c[i]; }
+    const char* begin() const { return c; }
+    const char* end() const { return c + n; }
+    char* begin() { return c; }
+    char* end() { return c + n; }
+    void push_back(char ch) {
+        if (n >= MAX_TOWER_HEIGHT) throw std::invalid_argument("Tower overflow");
+        c[n++] = ch;
+    }
+    Tower substr(size_t pos) const { return substr(pos, size_t(n) - pos); }
+    Tower substr(size_t pos, size_t len) const {
+        Tower t;
+        for (size_t i = pos; i < pos + len && i < (size_t)n; ++i) t.push_back(c[i]);
+        return t;
+    }
+    std::string str() const { return std::string(c, c + n); }
+    friend Tower operator+(const Tower& a, const Tower& b) {
+        Tower t = a;
+        for (char ch : b) t.push_back(ch);
+        return t;
+    }
+    friend bool operator==(const Tower& a, const Tower& b) {
+        if (a.n != b.n) return false;
+        for (uint8_t i = 0; i < a.n; ++i)
+            if (a.c[i] != b.c[i]) return false;
+        return true;
+    }
+};
+
+// POD replacement for std::map<uint8_t, std::string>: presence bitmask + flat
+// Tower array. Iteration is ascending-square (bit scan), matching std::map
+// order — serialize_fen and the move-gen loops rely on that. API mirrors the
+// std::map subset in use: at/find/erase/count/operator[]/empty/begin/end.
+struct StackMap {
+    uint64_t mask = 0;
+    Tower t[64] = {};
+
+    bool empty() const { return mask == 0; }
+    int count(uint8_t sq) const { return (mask >> sq) & 1; }
+    const Tower& at(uint8_t sq) const { return t[sq]; }
+    Tower& at(uint8_t sq) { return t[sq]; }
+    Tower& operator[](uint8_t sq) {
+        mask |= 1ULL << sq;
+        return t[sq];
+    }
+    void erase(uint8_t sq) {
+        mask &= ~(1ULL << sq);
+        t[sq] = Tower();
+    }
+    friend bool operator==(const StackMap& a, const StackMap& b) {
+        if (a.mask != b.mask) return false;
+        for (uint64_t m = a.mask; m; m &= m - 1) {
+            const int sq = __builtin_ctzll(m);
+            if (!(a.t[sq] == b.t[sq])) return false;
+        }
+        return true;
+    }
+
+    template <typename M, typename T>
+    struct iter {
+        M* m;
+        uint64_t rest;
+        struct entry {
+            uint8_t first;
+            T& second;
+        };
+        entry operator*() const {
+            const int sq = __builtin_ctzll(rest);
+            return {(uint8_t)sq, m->t[sq]};
+        }
+        struct arrow {
+            entry e;
+            entry* operator->() { return &e; }
+        };
+        arrow operator->() const { return {**this}; }
+        iter& operator++() {
+            rest &= rest - 1;
+            return *this;
+        }
+        bool operator==(const iter& o) const { return rest == o.rest; }
+        bool operator!=(const iter& o) const { return rest != o.rest; }
+    };
+    using iterator = iter<StackMap, Tower>;
+    using const_iterator = iter<const StackMap, const Tower>;
+
+    iterator begin() { return {this, mask}; }
+    iterator end() { return {this, 0}; }
+    const_iterator begin() const { return {this, mask}; }
+    const_iterator end() const { return {this, 0}; }
+    iterator find(uint8_t sq) { return {this, count(sq) ? (mask >> sq) << sq : 0}; }
+    const_iterator find(uint8_t sq) const { return {this, count(sq) ? (mask >> sq) << sq : 0}; }
+};
 
 // python-chess castling_rights bitmask: bits are the ROOK home squares.
 // a1=0 (Q), h1=7 (K), a8=56 (q), h8=63 (k). Matches state.py::_castling_field.
@@ -58,7 +163,7 @@ struct Board {
     int white_moves_left = 1;
     int rank8_count = 0;
     // ordered ascending by square -> matches sorted(stacks.items()) on serialize.
-    std::map<uint8_t, std::string> stacks;
+    StackMap stacks;
 
     uint64_t occupied() const { return occupied_white | occupied_black; }
 };
@@ -322,7 +427,7 @@ inline std::string serialize_fen(const Board& b) {
     for (const auto& [sq, pieces] : b.stacks) {  // std::map -> ascending square
         if (!first) overlay += ',';
         first = false;
-        overlay += square_name(sq) + ":" + pieces;
+        overlay += square_name(sq) + ":" + pieces.str();
     }
     return board_part + "[" + overlay + "] " + rest + suffix;
 }

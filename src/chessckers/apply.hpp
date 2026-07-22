@@ -59,14 +59,14 @@ inline void set_top_piece_on_board(Board& b, int sq, char top) {
 // Move the whole tower from->to, merging onto a friendly destination (incoming
 // on top). `override_pieces` substitutes the moving stack (sprint / demotion).
 inline void move_full_tower(Board& b, int from_sq, int to_sq,
-                            const std::string* override_pieces = nullptr) {
-    const std::string moving = override_pieces ? *override_pieces : b.stacks.at((uint8_t)from_sq);
+                            const Tower* override_pieces = nullptr) {
+    const Tower moving = override_pieces ? *override_pieces : b.stacks.at((uint8_t)from_sq);
     b.stacks.erase((uint8_t)from_sq);
     bb_remove_piece(b, from_sq);
-    std::string existing;
+    Tower existing;
     const auto it = b.stacks.find((uint8_t)to_sq);
     if (it != b.stacks.end()) existing = it->second;
-    const std::string new_stack = existing + moving;  // incoming on top
+    const Tower new_stack = existing + moving;  // incoming on top
     b.stacks[(uint8_t)to_sq] = new_stack;
     set_top_piece_on_board(b, to_sq, new_stack.back());
 }
@@ -92,40 +92,40 @@ struct BlackMove {
 };
 
 inline void apply_quiet_or_sprint(Board& b, const BlackMove& mv) {
-    const std::string pieces = b.stacks.at((uint8_t)mv.from_sq);
+    const Tower pieces = b.stacks.at((uint8_t)mv.from_sq);
     const bool is_sprint = pieces == "s" && (mv.from_sq >> 3) == 7 &&
                            std::abs((mv.to_sq >> 3) - (mv.from_sq >> 3)) == 2;
     if (is_sprint) {
-        const std::string ov = "S";
+        const Tower ov = "S";
         move_full_tower(b, mv.from_sq, mv.to_sq, &ov);
     } else {
         move_full_tower(b, mv.from_sq, mv.to_sq);
     }
     if ((mv.to_sq >> 3) == 0) {  // rank-1 promotion (after the merge)
-        const std::string promoted = promote_all_stones(b.stacks.at((uint8_t)mv.to_sq));
+        const Tower promoted = promote_all_stones(b.stacks.at((uint8_t)mv.to_sq));
         b.stacks[(uint8_t)mv.to_sq] = promoted;
         set_top_piece_on_board(b, mv.to_sq, promoted.back());
     }
 }
 
 inline void apply_deploy(Board& b, const BlackMove& mv) {
-    const std::string pieces = b.stacks.at((uint8_t)mv.from_sq);
+    const Tower pieces = b.stacks.at((uint8_t)mv.from_sq);
     const int s = mv.deploy_count;
-    const std::string sub = pieces.substr(pieces.size() - s);
-    const std::string remainder = pieces.substr(0, pieces.size() - s);
+    const Tower sub = pieces.substr(pieces.size() - s);
+    const Tower remainder = pieces.substr(0, pieces.size() - s);
     b.stacks[(uint8_t)mv.from_sq] = remainder;
     set_top_piece_on_board(b, mv.from_sq, remainder.back());
-    std::string existing;
+    Tower existing;
     const auto it = b.stacks.find((uint8_t)mv.to_sq);
     if (it != b.stacks.end()) existing = it->second;
-    std::string new_stack = existing + sub;
+    Tower new_stack = existing + sub;
     if ((mv.to_sq >> 3) == 0) new_stack = promote_all_stones(new_stack);
     b.stacks[(uint8_t)mv.to_sq] = new_stack;
     set_top_piece_on_board(b, mv.to_sq, new_stack.back());
 }
 
 inline void apply_charge(Board& b, const BlackMove& mv) {
-    const std::string pieces = b.stacks.at((uint8_t)mv.from_sq);
+    const Tower pieces = b.stacks.at((uint8_t)mv.from_sq);
     const int ff = mv.from_sq & 7, fr = mv.from_sq >> 3, tf = mv.to_sq & 7, tr = mv.to_sq >> 3;
     const int df = tf - ff, dr = tr - fr;
     const int d = std::max(std::abs(df), std::abs(dr));
@@ -145,7 +145,7 @@ inline void apply_charge(Board& b, const BlackMove& mv) {
     for (int i = 0; i < (int)pieces.size(); ++i)
         if (pieces[i] == 'k') king_positions.push_back(i + 1);
     const std::vector<int>& chosen = mv.demoted_kings.empty() ? king_positions : mv.demoted_kings;
-    std::string new_pieces = pieces;
+    Tower new_pieces = pieces;
     for (int pos : chosen) new_pieces[pos - 1] = 'S';
     move_full_tower(b, mv.from_sq, mv.to_sq, &new_pieces);
 }
@@ -168,12 +168,12 @@ inline void apply_diagonal_capture(Board& b, const BlackMove& mv) {
 }
 
 inline void apply_chain_move(Board& b, const BlackMove& mv) {
-    const std::string orig_stack = b.stacks.at((uint8_t)mv.from_sq);
+    const Tower orig_stack = b.stacks.at((uint8_t)mv.from_sq);
     for (const std::string& cap : mv.chain_all_captures) bb_remove_piece(b, parse_square(cap));
     b.stacks.erase((uint8_t)mv.from_sq);
     bb_remove_piece(b, mv.from_sq);
     if (mv.is_suicide) return;
-    const std::string final_stack = mv.chain_promotes ? promote_all_stones(orig_stack) : orig_stack;
+    const Tower final_stack = mv.chain_promotes ? promote_all_stones(orig_stack) : orig_stack;
     b.stacks[(uint8_t)mv.to_sq] = final_stack;
     if (final_stack.back() == 'k') bb_set_black_king(b, mv.to_sq);
     else bb_set_black_pawn(b, mv.to_sq);

@@ -121,7 +121,7 @@ struct CaptureHop {
 //    same key (different cadence), so both are kept.
 inline std::vector<CaptureHop> find_capture_hops(
     uint64_t occupied, uint64_t occupied_white,
-    const std::map<uint8_t, std::string>& stacks,
+    const StackMap& stacks,
     int f0, int r0, int df0, int dr0, int n) {
     std::vector<CaptureHop> options;
     std::vector<int> captures_so_far;
@@ -218,8 +218,8 @@ inline bool hop_promotes(const CaptureHop& hop) {
     return false;
 }
 
-inline std::string promote_all_stones(const std::string& stack) {
-    std::string out = stack;
+inline Tower promote_all_stones(const Tower& stack) {
+    Tower out = stack;
     for (char& c : out)
         if (c == 's' || c == 'S') c = 'k';
     return out;
@@ -249,8 +249,8 @@ struct ChainMove {
 // dedup + cadence-lock + last-dir(no-reversal) + suicide filter over the hop
 // atom, across the directions valid for the current tower top.
 inline std::vector<CaptureHop> next_capture_options(
-    uint64_t occupied, uint64_t occupied_white, const std::map<uint8_t, std::string>& stacks,
-    int cf, int cr, const std::string& cur_stack, bool has_last_dir, int ldf, int ldr, int n,
+    uint64_t occupied, uint64_t occupied_white, const StackMap& stacks,
+    int cf, int cr, const Tower& cur_stack, bool has_last_dir, int ldf, int ldr, int n,
     bool has_cadence, int cadence, bool include_suicide) {
     std::vector<CaptureHop> options;
     if (cur_stack.empty()) return options;
@@ -282,7 +282,7 @@ inline std::vector<CaptureHop> next_capture_options(
     return deduped;
 }
 
-inline ChainMove build_final_move(int chain_start, const std::string& orig_stack,
+inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
                                   const std::vector<CaptureHop>& hops) {
     const bool is_suicide_chain = !hops.empty() && hops.back().is_suicide;
     std::vector<int> all_captures;
@@ -313,7 +313,7 @@ inline ChainMove build_final_move(int chain_start, const std::string& orig_stack
     if (is_suicide_chain) {
         final_top = orig_stack.back();
     } else {
-        std::string stack_thru = orig_stack;
+        Tower stack_thru = orig_stack;
         for (auto& h : hops)
             if (hop_promotes(h)) stack_thru = promote_all_stones(stack_thru);
         final_top = stack_thru.back();
@@ -356,13 +356,13 @@ inline ChainMove build_final_move(int chain_start, const std::string& orig_stack
 
 struct HopApply {
     uint64_t occupied, occupied_white;
-    std::map<uint8_t, std::string> stacks;
-    std::string land_stack;
+    StackMap stacks;
+    Tower land_stack;
 };
 
 inline HopApply apply_hop(uint64_t occupied, uint64_t occupied_white,
-                          std::map<uint8_t, std::string> stacks, int cf, int cr,
-                          const std::string& cur_stack, const CaptureHop& hop) {
+                          StackMap stacks, int cf, int cr,
+                          const Tower& cur_stack, const CaptureHop& hop) {
     if (on_board(cf, cr)) {
         const int cur_sq = sq_idx(cf, cr);
         const uint64_t m = ~(1ULL << cur_sq);
@@ -375,7 +375,7 @@ inline HopApply apply_hop(uint64_t occupied, uint64_t occupied_white,
         occupied &= m;
         occupied_white &= m;
     }
-    std::string land_stack = hop_promotes(hop) ? promote_all_stones(cur_stack) : cur_stack;
+    Tower land_stack = hop_promotes(hop) ? promote_all_stones(cur_stack) : cur_stack;
     if (hop.landing_square >= 0) {
         const uint64_t mask = 1ULL << hop.landing_square;
         occupied |= mask;
@@ -386,11 +386,11 @@ inline HopApply apply_hop(uint64_t occupied, uint64_t occupied_white,
 }
 
 inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_white, long king_sq,
-                                       const std::map<uint8_t, std::string>& stacks, int chain_start,
-                                       int cf, int cr, const std::string& cur_stack,
+                                       const StackMap& stacks, int chain_start,
+                                       int cf, int cr, const Tower& cur_stack,
                                        bool has_last_dir, int ldf, int ldr,
                                        std::vector<CaptureHop> hops_so_far, bool has_cadence,
-                                       int cadence, int n, const std::string& orig_stack,
+                                       int cadence, int n, const Tower& orig_stack,
                                        std::vector<ChainMove>& results) {
     // White-king-captured short-circuit (game over -> stop extending the chain).
     if (king_sq >= 0 && (occupied_white & (1ULL << king_sq)) == 0) return;
@@ -421,11 +421,11 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
 
 inline std::vector<ChainMove> enumerate_chains(uint64_t occupied, uint64_t occupied_white,
                                                long king_sq,
-                                               const std::map<uint8_t, std::string>& stacks,
+                                               const StackMap& stacks,
                                                int chain_start) {
     const auto it = stacks.find((uint8_t)chain_start);
     if (it == stacks.end() || it->second.empty()) return {};
-    const std::string orig_stack = it->second;
+    const Tower orig_stack = it->second;
     const int n = (int)orig_stack.size();
     std::vector<ChainMove> results;
     enumerate_chains_recursive(occupied, occupied_white, king_sq, stacks, chain_start,
@@ -435,11 +435,11 @@ inline std::vector<ChainMove> enumerate_chains(uint64_t occupied, uint64_t occup
 }
 
 inline std::vector<ChainMove> first_hop_suicides(uint64_t occupied, uint64_t occupied_white,
-                                                 const std::map<uint8_t, std::string>& stacks,
+                                                 const StackMap& stacks,
                                                  int chain_start) {
     const auto it = stacks.find((uint8_t)chain_start);
     if (it == stacks.end() || it->second.empty()) return {};
-    const std::string pieces = it->second;
+    const Tower pieces = it->second;
     const int n = (int)pieces.size();
     const int cf = chain_start & 7, cr = chain_start >> 3;
     std::vector<ChainMove> moves;
@@ -451,10 +451,10 @@ inline std::vector<ChainMove> first_hop_suicides(uint64_t occupied, uint64_t occ
 
 inline std::vector<ChainMove> black_diagonal_capture_moves(uint64_t occupied, uint64_t occupied_white,
                                                            long king_sq,
-                                                           const std::map<uint8_t, std::string>& stacks) {
+                                                           const StackMap& stacks) {
     std::vector<ChainMove> moves;
     // std::map iterates ascending key order -> matches Rust keys.sort_unstable().
-    for (auto& [sq, pieces] : stacks) {
+    for (const auto& [sq, pieces] : stacks) {
         if (pieces.empty()) continue;
         auto chains = enumerate_chains(occupied, occupied_white, king_sq, stacks, sq);
         moves.insert(moves.end(), chains.begin(), chains.end());
@@ -476,9 +476,9 @@ inline QuietMove build_quiet(const std::string& from_name, int to_sq, char top) 
 }
 
 inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint64_t occupied_white,
-                                                         const std::map<uint8_t, std::string>& stacks) {
+                                                         const StackMap& stacks) {
     std::vector<QuietMove> moves;
-    for (auto& [from_sq, pieces] : stacks) {
+    for (const auto& [from_sq, pieces] : stacks) {
         if (pieces.empty()) continue;
         const int height = (int)pieces.size();
         const char top = pieces.back();
@@ -537,9 +537,9 @@ inline DeployMove build_deploy(const std::string& from_name, int to_sq, char top
 }
 
 inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t occupied_white,
-                                                  const std::map<uint8_t, std::string>& stacks) {
+                                                  const StackMap& stacks) {
     std::vector<DeployMove> moves;
-    for (auto& [from_sq, pieces] : stacks) {
+    for (const auto& [from_sq, pieces] : stacks) {
         const int n = (int)pieces.size();
         if (n < 2) continue;
         const char top = pieces.back();
@@ -581,9 +581,9 @@ struct ChargeMove {
 };
 
 inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t occupied_white,
-                                                  const std::map<uint8_t, std::string>& stacks) {
+                                                  const StackMap& stacks) {
     std::vector<ChargeMove> moves;
-    for (auto& [from_sq, pieces] : stacks) {
+    for (const auto& [from_sq, pieces] : stacks) {
         if (pieces.empty() || pieces.back() != 'k') continue;  // King-top towers only
         int n_kings = 0;
         for (char c : pieces)
@@ -686,7 +686,7 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                 {
                     std::vector<int> chosen(king_positions.begin(),
                                             king_positions.begin() + d);
-                    std::string new_pieces = pieces;
+                    Tower new_pieces = pieces;
                     for (int pos : chosen) new_pieces[pos - 1] = 'S';
                     ChargeMove m;
                     m.uci = from_name + landing_repr;
@@ -715,8 +715,8 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
 // hasMandatoryCapture (and the Rust/Python ports) including the adjacency
 // pre-filter. Bool early-exit, so stack iteration order is irrelevant.
 inline bool black_mandatory_capture_active(uint64_t occupied, uint64_t occupied_white,
-                                           const std::map<uint8_t, std::string>& stacks) {
-    for (auto& [from_sq, pieces] : stacks) {
+                                           const StackMap& stacks) {
+    for (const auto& [from_sq, pieces] : stacks) {
         if (pieces.empty()) continue;
         const int n = (int)pieces.size();
         const int from_file = from_sq & 7, from_rank = from_sq >> 3;
@@ -740,7 +740,7 @@ using AnyMove = std::variant<QuietMove, DeployMove, ChargeMove, ChainMove>;
 // otherwise quiets, deploys, charges, chains.
 inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t occupied_white,
                                                   long king_sq,
-                                                  const std::map<uint8_t, std::string>& stacks) {
+                                                  const StackMap& stacks) {
     auto quiet = black_diagonal_quiet_moves(occupied, occupied_white, stacks);
     auto deploy = black_deploy_moves(occupied, occupied_white, stacks);
     auto charge = black_charge_moves(occupied, occupied_white, stacks);
@@ -776,8 +776,8 @@ inline bool contains(const std::vector<int>& v, int x) {
 // Bool early-exit mirror of enumerate_chains_recursive: does any chain from here
 // path-capture the king?
 inline bool chain_captures_king_rec(uint64_t occupied, uint64_t occupied_white,
-                                    const std::map<uint8_t, std::string>& stacks, int cf, int cr,
-                                    const std::string& cur_stack, bool has_last_dir, int ldf, int ldr,
+                                    const StackMap& stacks, int cf, int cr,
+                                    const Tower& cur_stack, bool has_last_dir, int ldf, int ldr,
                                     bool has_cadence, int cadence, int n, int king) {
     if ((occupied_white & (1ULL << king)) == 0) return false;
     for (auto& hop : next_capture_options(occupied, occupied_white, stacks, cf, cr, cur_stack,
@@ -803,10 +803,10 @@ inline bool chain_captures_king_rec(uint64_t occupied, uint64_t occupied_white,
 }
 
 inline bool black_can_capture_white_king(uint64_t occupied, uint64_t occupied_white, long king_sq,
-                                         const std::map<uint8_t, std::string>& stacks) {
+                                         const StackMap& stacks) {
     if (king_sq < 0 || (occupied_white & (1ULL << king_sq)) == 0) return false;
     const int king = (int)king_sq;
-    for (auto& [sq, pieces] : stacks) {
+    for (const auto& [sq, pieces] : stacks) {
         if (pieces.empty()) continue;
         const int n = (int)pieces.size();
         const int cf = sq & 7, cr = sq >> 3;
@@ -826,9 +826,9 @@ inline bool black_can_capture_white_king(uint64_t occupied, uint64_t occupied_wh
 // height; Whites in path don't block, friendly Black towers do) + orthogonal
 // charges (King-top, n_kings>=2; rim-overshoot still attacks).
 inline bool square_attacked_by_black_chessckers(uint64_t occupied, uint64_t occupied_white,
-                                                const std::map<uint8_t, std::string>& stacks,
+                                                const StackMap& stacks,
                                                 int target_sq) {
-    for (auto& [from_sq, pieces] : stacks) {
+    for (const auto& [from_sq, pieces] : stacks) {
         if (pieces.empty()) continue;
         const int n = (int)pieces.size();
         const char top = pieces.back();
@@ -871,7 +871,7 @@ inline bool square_attacked_by_black_chessckers(uint64_t occupied, uint64_t occu
 }
 
 inline bool white_in_chessckers_check(uint64_t occupied, uint64_t occupied_white, long white_king,
-                                      const std::map<uint8_t, std::string>& stacks) {
+                                      const StackMap& stacks) {
     if (white_king < 0) return false;  // king already captured
     if (black_can_capture_white_king(occupied, occupied_white, white_king, stacks)) return true;
     return square_attacked_by_black_chessckers(occupied, occupied_white, stacks, (int)white_king);

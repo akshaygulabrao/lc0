@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -292,15 +291,15 @@ inline std::vector<WCandidate> white_pseudo_legal(const WhiteBoard& b) {
 struct WhiteApply {
     uint64_t occupied, occupied_white;
     int white_king;  // -1 == none
-    std::map<uint8_t, std::string> stacks;
+    StackMap stacks;
 };
 
 inline WhiteApply apply_white_candidate(const WhiteBoard& b, const WCandidate& c,
-                                        const std::map<uint8_t, std::string>& stacks) {
+                                        const StackMap& stacks) {
     const uint64_t from_m = 1ULL << c.from_sq, to_m = 1ULL << c.to_sq;
     uint64_t occ = b.occupied, own = b.occupied_white;
     int white_king = b.white_king_sq();
-    std::map<uint8_t, std::string> new_stacks = stacks;
+    StackMap new_stacks = stacks;
     if (c.capture_sq >= 0) {
         const uint64_t cap_m = 1ULL << c.capture_sq;
         occ &= ~cap_m;
@@ -324,7 +323,7 @@ inline WhiteApply apply_white_candidate(const WhiteBoard& b, const WCandidate& c
 }
 
 inline std::vector<WCandidate> white_legal_moves(const WhiteBoard& b,
-                                                 const std::map<uint8_t, std::string>& stacks) {
+                                                 const StackMap& stacks) {
     std::vector<WCandidate> out;
     for (auto& c : white_pseudo_legal(b)) {
         const auto ap = apply_white_candidate(b, c, stacks);
