@@ -74,6 +74,18 @@ float metal_matmul_selftest(int M, int K, int N) {
 
 namespace {
 
+// MPSGraph's run* methods compile (and internally cache) one executable per distinct
+// feed-shape tuple. K (batch) and M (flattened move count) vary almost every call, so
+// unbucketed shapes recompile the MLIR graph at steady state — that compile churn, not
+// kernel time, dominated the Metal path. Padding both to power-of-two buckets keeps the
+// shape set small so the cache hits; padded rows are zeros (denom 1, gather index 0),
+// per-sample ops don't mix rows, and results are sliced back to the real K/M.
+int shapeBucket(int n) {
+    int b = 8;
+    while (b < n) b <<= 1;
+    return b;
+}
+
 // A constant tensor straight off a WeightStore buffer (copies into NSData).
 MPSGraphTensor* constFrom(MPSGraph* g, const std::vector<float>& v, NSArray<NSNumber*>* shape) {
     NSData* d = [NSData dataWithBytes:v.data() length:v.size() * sizeof(float)];
@@ -397,7 +409,8 @@ std::vector<std::vector<float>> MetalTrunkV2::run(
     if (!p_->ok || K == 0) return result;
     @autoreleasepool {
         const int Cin = p_->c_in, C = p_->c_filters, HW = 100;
-        std::vector<float> flat((size_t)K * Cin * HW);
+        const int Kb = shapeBucket(K);
+        std::vector<float> flat((size_t)Kb * Cin * HW, 0.0f);
         for (int k = 0; k < K; ++k)
             std::copy(positions[k].begin(), positions[k].end(), &flat[(size_t)k * Cin * HW]);
         id<MTLBuffer> buf = [p_->dev newBufferWithBytes:flat.data()
@@ -405,14 +418,14 @@ std::vector<std::vector<float>> MetalTrunkV2::run(
                                                 options:MTLResourceStorageModeShared];
         MPSGraphTensorData* td =
             [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
-                                                    shape:@[ @(K), @(Cin), @10, @10 ]
+                                                    shape:@[ @(Kb), @(Cin), @10, @10 ]
                                                  dataType:MPSDataTypeFloat32];
         NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
             [p_->g runWithMTLCommandQueue:p_->q
                                     feeds:@{p_->in : td}
                             targetTensors:@[ p_->out ]
                          targetOperations:nil];
-        std::vector<float> outf((size_t)K * C * HW);
+        std::vector<float> outf((size_t)Kb * C * HW);
         [[res[p_->out] mpsndarray] readBytes:outf.data() strideBytes:nil];
         result.resize(K);
         for (int k = 0; k < K; ++k)
@@ -472,30 +485,40 @@ std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_heads_from_
                                                   options:MTLResourceStorageModeShared];
             return [[MPSGraphTensorData alloc] initWithMTLBuffer:b shape:shape dataType:dt];
         };
-        std::vector<float> flat((size_t)K * C * HW);
+        const int Kb = shapeBucket(K);
+        std::vector<float> flat((size_t)Kb * C * HW, 0.0f);
         for (int k = 0; k < K; ++k)
             std::copy(Fs[k].begin(), Fs[k].end(), &flat[(size_t)k * C * HW]);
         MPSGraphTensorData* dF = mkData(flat.data(), flat.size() * sizeof(float),
-                                        @[ @(K), @(C), @10, @10 ], MPSDataTypeFloat32);
+                                        @[ @(Kb), @(C), @10, @10 ], MPSDataTypeFloat32);
 
         const FlatMoves fm = flatten_moves(moves_per, net.d_move);
         const int M = fm.M, ntyp = fm.n_typ;
-        std::vector<float> wdl((size_t)K * 3), logits;
+        std::vector<float> wdl((size_t)Kb * 3), logits;
 
         if (M > 0) {
-            std::vector<int32_t> gfrom(M), gto(M);
+            const int Mb = shapeBucket(M);
+            // Padded move rows gather board 0/square 0 (any valid index) and are
+            // discarded below; denom 1 keeps the path-mean division finite.
+            std::vector<int32_t> gfrom((size_t)Mb, 0), gto((size_t)Mb, 0), gboard((size_t)Mb, 0);
             for (int i = 0; i < M; ++i) {
                 gfrom[i] = fm.board_of[i] * 100 + fm.from_idx[i];
                 gto[i] = fm.board_of[i] * 100 + fm.to_idx[i];
+                gboard[i] = fm.board_of[i];
             }
+            std::vector<float> pmask((size_t)Mb * 100, 0.0f), pden((size_t)Mb, 1.0f),
+                ptyp((size_t)Mb * ntyp, 0.0f);
+            std::copy(fm.pathmask.begin(), fm.pathmask.end(), pmask.begin());
+            std::copy(fm.denom.begin(), fm.denom.end(), pden.begin());
+            std::copy(fm.typ.begin(), fm.typ.end(), ptyp.begin());
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{
                 p_->hF : dF,
-                p_->hgfrom : mkData(gfrom.data(), (size_t)M * 4, @[ @(M) ], MPSDataTypeInt32),
-                p_->hgto : mkData(gto.data(), (size_t)M * 4, @[ @(M) ], MPSDataTypeInt32),
-                p_->hgboard : mkData(fm.board_of.data(), (size_t)M * 4, @[ @(M) ], MPSDataTypeInt32),
-                p_->hpmask : mkData(fm.pathmask.data(), (size_t)M * 100 * 4, @[ @(M), @100 ], MPSDataTypeFloat32),
-                p_->hpdenom : mkData(fm.denom.data(), (size_t)M * 4, @[ @(M), @1 ], MPSDataTypeFloat32),
-                p_->hptyp : mkData(fm.typ.data(), (size_t)M * ntyp * 4, @[ @(M), @(ntyp) ], MPSDataTypeFloat32),
+                p_->hgfrom : mkData(gfrom.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hgto : mkData(gto.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hgboard : mkData(gboard.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hpmask : mkData(pmask.data(), (size_t)Mb * 100 * 4, @[ @(Mb), @100 ], MPSDataTypeFloat32),
+                p_->hpdenom : mkData(pden.data(), (size_t)Mb * 4, @[ @(Mb), @1 ], MPSDataTypeFloat32),
+                p_->hptyp : mkData(ptyp.data(), (size_t)Mb * ntyp * 4, @[ @(Mb), @(ntyp) ], MPSDataTypeFloat32),
             };
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
                 [p_->gh runWithMTLCommandQueue:p_->q
@@ -503,7 +526,7 @@ std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_heads_from_
                                  targetTensors:@[ p_->hwdl, p_->hlogits ]
                               targetOperations:nil];
             [[res[p_->hwdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
-            logits.resize(M);
+            logits.resize(Mb);
             [[res[p_->hlogits] mpsndarray] readBytes:logits.data() strideBytes:nil];
         } else {
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
