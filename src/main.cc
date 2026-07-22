@@ -39,6 +39,10 @@
 #include "utils/trace.h"
 #include "version.h"
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 namespace lczero {
 void ChooseAndRunEngine() {
   // First try the engine which is explicitly specified on the command line.
@@ -75,6 +79,16 @@ void ChooseAndRunEngine() {
 }  // namespace lczero
 
 int main(int argc, const char** argv) {
+#ifdef __GLIBC__
+  // Pin the malloc mmap threshold. The NN backend allocates a ~1MB Item buffer
+  // per computation (AtomicVector of now-POD boards); glibc's DYNAMIC threshold
+  // adapts upward on the first few frees, after which these buffers come from
+  // the sbrk/arena heaps and the freed chunks are never returned to the OS —
+  // ~165MB/s of retained RSS at CUDA eval rates (2026-07-22, post-POD-refactor
+  // regression: the buffers crossed the threshold size when Board went POD).
+  // Pinning disables the adaptation so >128KB blocks always mmap/munmap.
+  mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+#endif
   LCTRACE_INITIALIZE;
   using namespace lczero;
   EscCodes::Init();
