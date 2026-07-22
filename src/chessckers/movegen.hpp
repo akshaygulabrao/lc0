@@ -41,17 +41,20 @@ inline bool on_board(int f, int r) { return f >= 0 && f <= 7 && r >= 0 && r <= 7
 inline bool on_grid(int f, int r) { return f >= -1 && f <= 8 && r >= -1 && r <= 8; }
 inline int sq_idx(int f, int r) { return (r << 3) | f; }
 
-// (file, rank) on the 10×10 grid -> 2-char key. Rim files use 'z'/'i' for
-// -1/8, rim ranks use '0'/'9' for -1/8. Matches Python _COORD_KEY / Rust coord_key.
-inline std::string coord_key(int f, int r) {
-    char fc;
-    if (f == -1) fc = 'z';
-    else if (f >= 0 && f <= 7) fc = char('a' + f);
-    else if (f == 8) fc = 'i';
-    else fc = '?';
+// (file, rank) on the 10×10 grid packed as a single byte: rank10*10 + file10,
+// where file10/rank10 = board coord + 1 (rim -1 -> 0, rim 8 -> 9). Range 0..99.
+inline uint8_t coord10_of(int f, int r) { return (uint8_t)((r + 1) * 10 + (f + 1)); }
+inline int c10_file(uint8_t c10) { return c10 % 10 - 1; }  // board file, -1..8
+inline int c10_rank(uint8_t c10) { return c10 / 10 - 1; }  // board rank, -1..8
+
+// coord10 -> the 2-char key string. Byte-identical to the historical coord_key
+// (Python _COORD_KEY / Rust coord_key): rim files 'z'/'i' for -1/8, rank digit
+// '0'..'9' for -1..8.
+inline std::string key_str(uint8_t c10) {
+    const int f10 = c10 % 10, r10 = c10 / 10;
     std::string s;
-    s += fc;
-    s += char('0' + (r + 1));  // r in [-1,8] -> digit '0'..'9'
+    s += (f10 == 0) ? 'z' : (f10 == 9) ? 'i' : char('a' + f10 - 1);
+    s += char('0' + r10);
     return s;
 }
 
@@ -67,7 +70,7 @@ inline int owner(uint64_t occupied, uint64_t occupied_white, int sq) {
 struct PathStep {
     int f, r;
     int sq;  // -1 if rim
-    std::string key;
+    uint8_t c10;
     int df, dr;
     bool did_bounce;  // always false (kept for shape parity with Rust/Python)
 };
@@ -88,7 +91,7 @@ inline const std::map<std::tuple<int, int, int, int>, std::vector<PathStep>>& ca
                             f = nf;
                             r = nr;
                             const int sq = on_board(f, r) ? sq_idx(f, r) : -1;
-                            steps.push_back(PathStep{f, r, sq, coord_key(f, r), df0, dr0, false});
+                            steps.push_back(PathStep{f, r, sq, coord10_of(f, r), df0, dr0, false});
                         }
                         paths[{f0, r0, df0, dr0}] = std::move(steps);
                     }
@@ -101,10 +104,10 @@ inline const std::map<std::tuple<int, int, int, int>, std::vector<PathStep>>& ca
 
 struct CaptureHop {
     int df, dr;                          // direction
-    std::string landing_key;
+    uint8_t landing_c10;                 // coord10 of the landing key
     int landing_square;                  // -1 == None (rim / overshoot)
     std::vector<int> captures;           // board squares of Whites captured on the path
-    std::vector<std::string> waypoints;  // every traced step's key (incl. landing)
+    std::vector<uint8_t> waypoints;      // every traced step's coord10 (incl. landing)
     bool is_suicide;
     bool crossed_rank1;
     int cadence;                         // landing distance k
@@ -126,7 +129,7 @@ inline std::vector<CaptureHop> find_capture_hops(
     std::vector<CaptureHop> options;
     std::vector<int> captures_so_far;
     uint64_t captured_set = 0;
-    std::vector<std::string> waypoints_so_far;
+    std::vector<uint8_t> waypoints_so_far;
     bool crossed_rank1 = false;
     bool friendly_blocked = false;
 
@@ -138,7 +141,7 @@ inline std::vector<CaptureHop> find_capture_hops(
     for (int step_idx = 0; step_idx < (int)path.size(); ++step_idx) {
         if (step_idx >= max_step) break;
         const PathStep& step = path[step_idx];
-        const std::string& cur_key = step.key;
+        const uint8_t cur_key = step.c10;
         waypoints_so_far.push_back(cur_key);
         if (step.r == 0) crossed_rank1 = true;
         const int step_num = step_idx + 1;  // 1-based landing distance k
@@ -195,18 +198,6 @@ inline std::vector<CaptureHop> find_capture_hops(
 // black_diagonal_capture_moves_native) and the pure-Python reference in
 // moves_black.py. Builds the full capture MoveDicts on top of the hop atom.
 
-inline std::optional<std::pair<int, int>> parse_waypoint_key(const std::string& s) {
-    if (s.size() != 2) return std::nullopt;
-    const char fc = s[0], rc = s[1];
-    int f;
-    if (fc == 'z') f = -1;
-    else if (fc >= 'a' && fc <= 'h') f = fc - 'a';
-    else if (fc == 'i') f = 8;
-    else return std::nullopt;
-    if (rc < '0' || rc > '9') return std::nullopt;
-    return std::make_pair(f, (rc - '0') - 1);
-}
-
 inline std::vector<std::pair<int, int>> dirs_for_top(char top) {
     if (top == 'k') return {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
     return {{-1, -1}, {1, -1}};
@@ -225,25 +216,18 @@ inline Tower promote_all_stones(const Tower& stack) {
     return out;
 }
 
-inline std::string join(const std::vector<std::string>& v, const std::string& sep) {
-    std::string out;
-    for (size_t i = 0; i < v.size(); ++i) {
-        if (i) out += sep;
-        out += v[i];
-    }
-    return out;
-}
-
 struct ChainMove {
-    std::string uci, from_name, to_name;
-    std::string piece;  // "king" / "pawn"
-    std::optional<std::string> capture;
-    std::optional<std::vector<std::string>> waypoints;
-    std::vector<std::string> chain_hops;
-    std::vector<std::string> chain_all_captures;
-    bool is_suicide;
-    bool chain_promotes;
-    int cadence;
+    std::string uci;
+    uint8_t from_sq = 0, to_sq = 0;          // 8x8 square indices
+    bool is_king = false;                     // "king" vs "pawn"
+    int16_t capture_sq = -1;                  // 8x8 square; -1 == none
+    bool has_waypoints = false;               // null-vs-present (JSON parity)
+    std::vector<uint8_t> waypoints;           // coord10
+    std::vector<uint8_t> chain_hops;          // coord10
+    std::vector<uint8_t> chain_all_captures;  // 8x8 squares
+    bool is_suicide = false;
+    bool chain_promotes = false;
+    int cadence = 0;
 };
 
 // dedup + cadence-lock + last-dir(no-reversal) + suicide filter over the hop
@@ -271,11 +255,11 @@ inline std::vector<CaptureHop> next_capture_options(
             if (h.cadence == cadence) t.push_back(h);
         options = std::move(t);
     }
-    // identity = (df, dr, landing_key, captures, is_suicide, is_overshoot, cadence)
-    std::set<std::tuple<int, int, std::string, std::vector<int>, bool, bool, int>> seen;
+    // identity = (df, dr, landing_c10, captures, is_suicide, is_overshoot, cadence)
+    std::set<std::tuple<int, int, uint8_t, std::vector<int>, bool, bool, int>> seen;
     std::vector<CaptureHop> deduped;
     for (auto& h : options) {
-        auto key = std::make_tuple(h.df, h.dr, h.landing_key, h.captures, h.is_suicide,
+        auto key = std::make_tuple(h.df, h.dr, h.landing_c10, h.captures, h.is_suicide,
                                    h.is_overshoot, h.cadence);
         if (seen.insert(key).second) deduped.push_back(h);
     }
@@ -286,11 +270,11 @@ inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
                                   const std::vector<CaptureHop>& hops) {
     const bool is_suicide_chain = !hops.empty() && hops.back().is_suicide;
     std::vector<int> all_captures;
-    std::vector<std::string> all_waypoints, hop_keys;
+    std::vector<uint8_t> all_waypoints, hop_keys;
     for (auto& h : hops) {
         all_captures.insert(all_captures.end(), h.captures.begin(), h.captures.end());
         all_waypoints.insert(all_waypoints.end(), h.waypoints.begin(), h.waypoints.end());
-        hop_keys.push_back(h.landing_key);
+        hop_keys.push_back(h.landing_c10);
     }
 
     const int last_landing = hops.empty() ? -1 : hops.back().landing_square;
@@ -301,9 +285,9 @@ inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
         // End-of-turn fallback: last on-board waypoint, else the chain start.
         final_landing = chain_start;
         for (auto it = all_waypoints.rbegin(); it != all_waypoints.rend(); ++it) {
-            const auto pr = parse_waypoint_key(*it);
-            if (pr && on_board(pr->first, pr->second)) {
-                final_landing = sq_idx(pr->first, pr->second);
+            const int f = c10_file(*it), r = c10_rank(*it);
+            if (on_board(f, r)) {
+                final_landing = sq_idx(f, r);
                 break;
             }
         }
@@ -319,19 +303,19 @@ inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
         final_top = stack_thru.back();
     }
 
-    const std::string from_name = square_name(chain_start);
-    const std::string dest_name = square_name(final_landing);
-
-    std::optional<std::string> capture;
-    if (!all_captures.empty()) capture = square_name(all_captures[0]);
-    else if (is_suicide_chain) capture = square_name(final_landing);
+    int capture_sq = -1;
+    if (!all_captures.empty()) capture_sq = all_captures[0];
+    else if (is_suicide_chain) capture_sq = final_landing;
 
     const int cadence = hops[0].cadence;
-    const std::string uci =
-        "c" + std::to_string(cadence) + ":" + from_name + "~" + join(hop_keys, "~") + "->" + dest_name;
+    std::string uci = "c" + std::to_string(cadence) + ":" + square_name(chain_start);
+    for (uint8_t hk : hop_keys) {
+        uci += '~';
+        uci += key_str(hk);
+    }
+    uci += "->";
+    uci += square_name(final_landing);
 
-    std::vector<std::string> all_cap_names;
-    for (int sq : all_captures) all_cap_names.push_back(square_name(sq));
     bool chain_promotes_any = false;
     for (auto& h : hops)
         if (hop_promotes(h)) {
@@ -340,14 +324,17 @@ inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
         }
 
     ChainMove m;
-    m.uci = uci;
-    m.from_name = from_name;
-    m.to_name = dest_name;
-    m.piece = (final_top == 'k') ? "king" : "pawn";
-    m.capture = capture;
-    if (hops.size() > 1) m.waypoints = all_waypoints;
-    m.chain_hops = hop_keys;
-    m.chain_all_captures = all_cap_names;
+    m.uci = std::move(uci);
+    m.from_sq = (uint8_t)chain_start;
+    m.to_sq = (uint8_t)final_landing;
+    m.is_king = (final_top == 'k');
+    m.capture_sq = (int16_t)capture_sq;
+    if (hops.size() > 1) {
+        m.has_waypoints = true;
+        m.waypoints = std::move(all_waypoints);
+    }
+    m.chain_hops = std::move(hop_keys);
+    m.chain_all_captures.assign(all_captures.begin(), all_captures.end());
     m.is_suicide = is_suicide_chain;
     m.chain_promotes = chain_promotes_any;
     m.cadence = cadence;
@@ -408,9 +395,8 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
             nf = hop.landing_square & 7;
             nr = hop.landing_square >> 3;
         } else {
-            const auto pr = parse_waypoint_key(hop.landing_key);
-            nf = pr ? pr->first : cf;
-            nr = pr ? pr->second : cr;
+            nf = c10_file(hop.landing_c10);
+            nr = c10_rank(hop.landing_c10);
         }
         const int next_cadence = has_cadence ? cadence : hop.cadence;
         enumerate_chains_recursive(ap.occupied, ap.occupied_white, king_sq, ap.stacks, chain_start,
@@ -467,12 +453,18 @@ inline std::vector<ChainMove> black_diagonal_capture_moves(uint64_t occupied, ui
 // -------- Quiet diagonals + sprint (Slice 2b) --------
 
 struct QuietMove {
-    std::string uci, from_name, to_name, piece;
+    std::string uci;
+    uint8_t from_sq = 0, to_sq = 0;
+    bool is_king = false;  // "king" vs "pawn"
 };
 
-inline QuietMove build_quiet(const std::string& from_name, int to_sq, char top) {
-    const std::string to_name = square_name(to_sq);
-    return {from_name + to_name, from_name, to_name, (top == 'k') ? "king" : "pawn"};
+inline QuietMove build_quiet(int from_sq, int to_sq, char top) {
+    QuietMove m;
+    m.uci = square_name(from_sq) + square_name(to_sq);
+    m.from_sq = (uint8_t)from_sq;
+    m.to_sq = (uint8_t)to_sq;
+    m.is_king = (top == 'k');
+    return m;
 }
 
 inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint64_t occupied_white,
@@ -483,7 +475,6 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
         const int height = (int)pieces.size();
         const char top = pieces.back();
         const int from_file = from_sq & 7, from_rank = from_sq >> 3;
-        const std::string from_name = square_name(from_sq);
 
         for (auto [df, dr] : dirs_for_top(top)) {
             for (int k = 1; k <= height; ++k) {
@@ -492,13 +483,13 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
                 const int to_sq = sq_idx(tf, tr);
                 const int o = owner(occupied, occupied_white, to_sq);
                 if (o == SQ_EMPTY) {
-                    moves.push_back(build_quiet(from_name, to_sq, top));
+                    moves.push_back(build_quiet(from_sq, to_sq, top));
                     continue;
                 }
                 if (o == SQ_BLACK && stacks.count((uint8_t)to_sq)) {  // friendly merge: emit + stop, capped
                     const auto& existing = stacks.at((uint8_t)to_sq);
                     if ((int)existing.size() + height <= MAX_TOWER_HEIGHT)
-                        moves.push_back(build_quiet(from_name, to_sq, top));
+                        moves.push_back(build_quiet(from_sq, to_sq, top));
                     break;
                 }
                 break;  // White piece (or any non-friendly): blocks the slide; no quiet landing past it.
@@ -516,7 +507,7 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
                 const int o = owner(occupied, occupied_white, to_sq);
                 if (o == SQ_EMPTY || (o == SQ_BLACK && stacks.count((uint8_t)to_sq) &&
                                        (int)stacks.at((uint8_t)to_sq).size() + 1 <= MAX_TOWER_HEIGHT))
-                    moves.push_back(build_quiet(from_name, to_sq, top));
+                    moves.push_back(build_quiet(from_sq, to_sq, top));
             }
         }
     }
@@ -526,14 +517,20 @@ inline std::vector<QuietMove> black_diagonal_quiet_moves(uint64_t occupied, uint
 // -------- Deploys (Slice 2b) --------
 
 struct DeployMove {
-    std::string uci, from_name, to_name, piece;
-    int deploy_count;
+    std::string uci;
+    uint8_t from_sq = 0, to_sq = 0;
+    bool is_king = false;  // "king" vs "pawn"
+    int deploy_count = 0;
 };
 
-inline DeployMove build_deploy(const std::string& from_name, int to_sq, char top, int s) {
-    const std::string to_name = square_name(to_sq);
-    return {from_name + to_name + "[" + std::to_string(s) + "]", from_name, to_name,
-            (top == 'k') ? "king" : "pawn", s};
+inline DeployMove build_deploy(int from_sq, int to_sq, char top, int s) {
+    DeployMove m;
+    m.uci = square_name(from_sq) + square_name(to_sq) + "[" + std::to_string(s) + "]";
+    m.from_sq = (uint8_t)from_sq;
+    m.to_sq = (uint8_t)to_sq;
+    m.is_king = (top == 'k');
+    m.deploy_count = s;
+    return m;
 }
 
 inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t occupied_white,
@@ -544,7 +541,6 @@ inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t oc
         if (n < 2) continue;
         const char top = pieces.back();
         const int from_file = from_sq & 7, from_rank = from_sq >> 3;
-        const std::string from_name = square_name(from_sq);
         for (int s = 1; s < n; ++s) {
             for (auto [df, dr] : dirs_for_top(top)) {
                 for (int k = 1; k <= s; ++k) {
@@ -553,13 +549,13 @@ inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t oc
                     const int to_sq = sq_idx(tf, tr);
                     const int o = owner(occupied, occupied_white, to_sq);
                     if (o == SQ_EMPTY) {
-                        moves.push_back(build_deploy(from_name, to_sq, top, s));
+                        moves.push_back(build_deploy(from_sq, to_sq, top, s));
                         continue;
                     }
                     if (o == SQ_BLACK && stacks.count((uint8_t)to_sq)) {
                         const auto& existing = stacks.at((uint8_t)to_sq);
                         if ((int)existing.size() + s <= MAX_TOWER_HEIGHT)
-                            moves.push_back(build_deploy(from_name, to_sq, top, s));
+                            moves.push_back(build_deploy(from_sq, to_sq, top, s));
                     }
                     break;
                 }
@@ -572,9 +568,12 @@ inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t oc
 // -------- Charges (Slice 2c) --------
 
 struct ChargeMove {
-    std::string uci, from_name, to_name, piece;
-    std::optional<std::string> capture;
-    std::optional<std::vector<std::string>> waypoints;       // [rim key] for overshoot charge
+    std::string uci;
+    uint8_t from_sq = 0, to_sq = 0;
+    bool is_king = false;                                    // "king" vs "pawn"
+    int16_t capture_sq = -1;                                 // 8x8 square; -1 == none
+    bool has_waypoints = false;                              // null-vs-present (JSON parity)
+    std::vector<uint8_t> waypoints;                          // [rim c10] for overshoot charge
     std::optional<std::vector<int>> demoted_kings;           // chosen king positions (1-based)
     std::optional<int> demotions_required;
     std::optional<std::vector<int>> source_king_positions;
@@ -590,7 +589,6 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
             if (c == 'k') ++n_kings;
         if (n_kings == 0) continue;
         const int from_file = from_sq & 7, from_rank = from_sq >> 3;
-        const std::string from_name = square_name(from_sq);
         std::vector<int> king_positions;  // 1-based indices of kings in the tower
         for (int i = 0; i < (int)pieces.size(); ++i)
             if (pieces[i] == 'k') king_positions.push_back(i + 1);
@@ -601,7 +599,7 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                 if (stop_after) break;
                 // Path scan over intermediate squares 1..d-1.
                 bool blocked = false, off_grid = false;
-                std::vector<std::string> path_captures;
+                std::vector<int> path_captures;
                 int last_on_board_sq = -1;
                 for (int k = 1; k < d; ++k) {
                     const int pf = from_file + k * df, pr = from_rank + k * dr;
@@ -616,7 +614,7 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                             blocked = true;
                             break;
                         }
-                        if (po == SQ_WHITE) path_captures.push_back(square_name(psq));
+                        if (po == SQ_WHITE) path_captures.push_back(psq);
                         last_on_board_sq = psq;
                     }
                     // else: rim square, no action
@@ -627,45 +625,38 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                 const int tf = from_file + d * df, tr = from_rank + d * dr;
                 if (tf < -1 || tf > 8 || tr < -1 || tr > 8) break;  // off-grid landing
 
-                std::string to_name;
                 bool is_ram = false, is_friendly_merge = false;
                 int landing_sq = -1;
-                std::optional<std::string> rim_landing_key;
+                int to_sq;  // the settled 8x8 square ("to" in dict/uci terms)
+                bool has_rim_landing = false;
+                uint8_t rim_landing_c10 = 0;
                 if (tf >= 0 && tf <= 7 && tr >= 0 && tr <= 7) {
                     landing_sq = sq_idx(tf, tr);
-                    to_name = square_name(landing_sq);
+                    to_sq = landing_sq;
                     const int o = owner(occupied, occupied_white, landing_sq);
                     is_ram = (o == SQ_WHITE);
                     is_friendly_merge = (o == SQ_BLACK && stacks.count((uint8_t)landing_sq));
                 } else {
                     // Rim landing -> fall back to the last on-board square.
                     if (last_on_board_sq < 0) continue;  // d=1 rim: nothing to settle on
-                    to_name = square_name(last_on_board_sq);
-                    rim_landing_key = coord_key(tf, tr);
+                    to_sq = last_on_board_sq;
+                    has_rim_landing = true;
+                    rim_landing_c10 = coord10_of(tf, tr);
                 }
 
-                std::string landing_repr;
-                std::optional<std::vector<std::string>> charge_waypoints;
-                if (!rim_landing_key) {
-                    landing_repr = to_name;
-                } else {
-                    landing_repr = *rim_landing_key + "->" + to_name;  // e.g. e0->e1
-                    charge_waypoints = std::vector<std::string>{*rim_landing_key};
-                }
-
-                std::optional<std::string> capture_field;
-                if (!path_captures.empty()) capture_field = path_captures[0];
-                else if (is_ram) capture_field = to_name;
+                int capture_sq = -1;
+                if (!path_captures.empty()) capture_sq = path_captures[0];
+                else if (is_ram) capture_sq = to_sq;
 
                 if (is_ram) {
                     // §3C: a ram requires >=1 path capture (must overshoot an enemy).
                     if (!path_captures.empty()) {
                         ChargeMove m;
-                        m.uci = from_name + to_name;
-                        m.from_name = from_name;
-                        m.to_name = to_name;
-                        m.piece = "king";
-                        m.capture = capture_field;
+                        m.uci = square_name(from_sq) + square_name(to_sq);
+                        m.from_sq = (uint8_t)from_sq;
+                        m.to_sq = (uint8_t)to_sq;
+                        m.is_king = true;
+                        m.capture_sq = (int16_t)capture_sq;
                         moves.push_back(std::move(m));
                     }
                     continue;
@@ -689,12 +680,21 @@ inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t oc
                     Tower new_pieces = pieces;
                     for (int pos : chosen) new_pieces[pos - 1] = 'S';
                     ChargeMove m;
-                    m.uci = from_name + landing_repr;
-                    m.from_name = from_name;
-                    m.to_name = to_name;
-                    m.piece = (new_pieces.back() == 'k') ? "king" : "pawn";
-                    m.capture = capture_field;
-                    m.waypoints = charge_waypoints;
+                    // rim overshoot uci is `<from><rimkey>-><to>`, e.g. e2e0->e1
+                    m.uci = square_name(from_sq);
+                    if (has_rim_landing) {
+                        m.uci += key_str(rim_landing_c10);
+                        m.uci += "->";
+                    }
+                    m.uci += square_name(to_sq);
+                    m.from_sq = (uint8_t)from_sq;
+                    m.to_sq = (uint8_t)to_sq;
+                    m.is_king = (new_pieces.back() == 'k');
+                    m.capture_sq = (int16_t)capture_sq;
+                    if (has_rim_landing) {
+                        m.has_waypoints = true;
+                        m.waypoints = {rim_landing_c10};
+                    }
                     m.demoted_kings = chosen;
                     m.demotions_required = d;
                     m.source_king_positions = king_positions;
@@ -750,7 +750,7 @@ inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t oc
     std::vector<AnyMove> out;
     if (mandate) {
         for (auto& c : charge)
-            if (c.capture.has_value()) out.push_back(c);
+            if (c.capture_sq >= 0) out.push_back(c);
         for (auto& cm : chain) out.push_back(cm);
     } else {
         for (auto& q : quiet) out.push_back(q);
@@ -790,9 +790,8 @@ inline bool chain_captures_king_rec(uint64_t occupied, uint64_t occupied_white,
             nf = hop.landing_square & 7;
             nr = hop.landing_square >> 3;
         } else {
-            const auto pr = parse_waypoint_key(hop.landing_key);
-            nf = pr ? pr->first : cf;
-            nr = pr ? pr->second : cr;
+            nf = c10_file(hop.landing_c10);
+            nr = c10_rank(hop.landing_c10);
         }
         const int next_cadence = has_cadence ? cadence : hop.cadence;
         if (chain_captures_king_rec(ap.occupied, ap.occupied_white, ap.stacks, nf, nr, ap.land_stack,

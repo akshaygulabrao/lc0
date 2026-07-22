@@ -72,22 +72,8 @@ inline int promo_index(const std::string& p) {
     return 0;
 }
 
-// 10x10 waypoint key -> (file10, rank10): rim files 'z'/'i' -> 0/9, 'a'..'h' ->
-// 1..8; rank is the digit. None on malformed.
-inline std::optional<std::pair<int, int>> file_rank10(const std::string& w) {
-    if (w.size() != 2) return std::nullopt;
-    int f;
-    const char fc = w[0], rc = w[1];
-    if (fc == 'z') f = 0;
-    else if (fc >= 'a' && fc <= 'h') f = fc - 'a' + 1;
-    else if (fc == 'i') f = 9;
-    else return std::nullopt;
-    if (rc < '0' || rc > '9') return std::nullopt;
-    return std::make_pair(f, rc - '0');
-}
-
 inline std::vector<float> encode_move(int from_sq, int to_sq, bool has_capture,
-                                      const std::vector<std::string>& waypoints, bool has_deploy,
+                                      const std::vector<uint8_t>& waypoints, bool has_deploy,
                                       int deploy_count, bool has_demotions, int demotions_required,
                                       const std::string& promotion) {
     std::vector<float> out(ENC_MOVE_D, 0.0f);
@@ -101,10 +87,9 @@ inline std::vector<float> encode_move(int from_sq, int to_sq, bool has_capture,
     out[133] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 5.0);
     out[134] = static_cast<float>(static_cast<double>(has_demotions ? demotions_required : 0) / 8.0);
     out[135 + promo_index(promotion)] = 1.0f;
-    for (const auto& w : waypoints) {
-        const auto fr = file_rank10(w);
-        if (fr) out[140 + fr->second * 10 + fr->first] = 1.0f;
-    }
+    // waypoint coord10 == rank10*10 + file10, exactly the historical
+    // file_rank10(w) parse of the 2-char key -> direct index.
+    for (const uint8_t w : waypoints) out[140 + w] = 1.0f;
     return out;
 }
 
@@ -171,7 +156,7 @@ inline int promo_index_v2(const std::string& p) {
 }
 
 inline std::vector<float> encode_move_v2(int from_sq, int to_sq,
-                                         const std::vector<std::string>& waypoints, bool has_capture,
+                                         const std::vector<uint8_t>& waypoints, bool has_capture,
                                          bool has_deploy, int deploy_count, bool has_demotions,
                                          int demotions_required, const std::string& promotion) {
     std::vector<float> out(ENC_MOVE_D_V2, 0.0f);
@@ -180,10 +165,8 @@ inline std::vector<float> encode_move_v2(int from_sq, int to_sq,
     const int ti = to_ok ? sq10_of(to_sq) : 11;
     out[0] = static_cast<float>(fi);
     out[1] = static_cast<float>(ti);
-    for (const auto& w : waypoints) {
-        const auto fr = file_rank10(w);
-        if (fr) out[2 + fr->second * 10 + fr->first] = 1.0f;
-    }
+    // waypoint coord10 == rank10*10 + file10 (see encode_move) -> direct index.
+    for (const uint8_t w : waypoints) out[2 + w] = 1.0f;
     if (from_ok) out[2 + fi] = 0.0f;   // endpoints gathered separately, never path cells
     if (to_ok) out[2 + ti] = 0.0f;
     const int s = 102;

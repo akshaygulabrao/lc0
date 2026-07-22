@@ -39,7 +39,7 @@ namespace {
 int NativeFromSq(const cc::NativeMove& nm) {
   if (nm.is_white) return nm.white_src.from_sq;
   int sq = 0;
-  std::visit([&](auto&& x) { sq = cc::parse_square(x.from_name); }, nm.black_src);
+  std::visit([&](auto&& x) { sq = x.from_sq; }, nm.black_src);
   return sq;
 }
 int NativeToSq(const cc::NativeMove& nm) {
@@ -47,7 +47,7 @@ int NativeToSq(const cc::NativeMove& nm) {
     return nm.is_castling_alt ? nm.white_src.castling_rook_sq : nm.white_src.to_sq;
   }
   int sq = 0;
-  std::visit([&](auto&& x) { sq = cc::parse_square(x.to_name); }, nm.black_src);
+  std::visit([&](auto&& x) { sq = x.to_sq; }, nm.black_src);
   return sq;
 }
 }  // namespace

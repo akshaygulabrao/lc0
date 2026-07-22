@@ -85,7 +85,7 @@ struct BlackMove {
     bool has_chain_hops = false;
     bool has_capture = false;
     bool has_waypoints = false;  // overshoot charge
-    std::vector<std::string> chain_all_captures;
+    std::vector<uint8_t> chain_all_captures;  // 8x8 squares
     bool is_suicide = false;
     bool chain_promotes = false;
     std::vector<int> demoted_kings;  // empty -> forced (all kings)
@@ -169,7 +169,7 @@ inline void apply_diagonal_capture(Board& b, const BlackMove& mv) {
 
 inline void apply_chain_move(Board& b, const BlackMove& mv) {
     const Tower orig_stack = b.stacks.at((uint8_t)mv.from_sq);
-    for (const std::string& cap : mv.chain_all_captures) bb_remove_piece(b, parse_square(cap));
+    for (const uint8_t cap : mv.chain_all_captures) bb_remove_piece(b, cap);
     b.stacks.erase((uint8_t)mv.from_sq);
     bb_remove_piece(b, mv.from_sq);
     if (mv.is_suicide) return;

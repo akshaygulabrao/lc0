@@ -17,7 +17,7 @@
 #include "apply.hpp"      // BlackMove / WhiteMove + apply_black_move / apply_white_move
 #include "encode.hpp"     // encode_move / encode_move_v2
 #include "movegen.hpp"    // AnyMove + all_black_legal_moves
-#include "movegen_white.hpp"  // WCandidate / white_legal_moves / wpiece_from_name / white_uci
+#include "movegen_white.hpp"  // WCandidate / white_legal_moves / white_uci
 #include "nn.hpp"         // ChesskersNet (is_v2 selects the encoder)
 
 namespace cc {
@@ -39,19 +39,19 @@ inline BlackMove black_apply_of(const AnyMove& mv) {
     std::visit(
         [&](auto&& x) {
             using T = std::decay_t<decltype(x)>;
-            bm.from_sq = parse_square(x.from_name);
-            bm.to_sq = parse_square(x.to_name);
+            bm.from_sq = x.from_sq;
+            bm.to_sq = x.to_sq;
             if constexpr (std::is_same_v<T, DeployMove>) {
                 bm.has_deploy_count = true;
                 bm.deploy_count = x.deploy_count;
             } else if constexpr (std::is_same_v<T, ChargeMove>) {
-                bm.has_capture = x.capture.has_value();
-                bm.has_waypoints = x.waypoints.has_value();
+                bm.has_capture = x.capture_sq >= 0;
+                bm.has_waypoints = x.has_waypoints;
                 if (x.demoted_kings) bm.demoted_kings = *x.demoted_kings;
             } else if constexpr (std::is_same_v<T, ChainMove>) {
                 bm.has_chain_hops = true;
-                bm.has_capture = x.capture.has_value();
-                bm.has_waypoints = x.waypoints.has_value();
+                bm.has_capture = x.capture_sq >= 0;
+                bm.has_waypoints = x.has_waypoints;
                 bm.chain_all_captures = x.chain_all_captures;
                 bm.is_suicide = x.is_suicide;
                 bm.chain_promotes = x.chain_promotes;
@@ -66,25 +66,25 @@ inline BlackMove black_apply_of(const AnyMove& mv) {
 inline std::vector<float> black_encode(const ChesskersNet& net, const AnyMove& mv) {
     int from_sq = 0, to_sq = 0, deploy_count = 0, dem_req = 0;
     bool has_capture = false, has_deploy = false, has_dem = false;
-    std::vector<std::string> wps;
+    std::vector<uint8_t> wps;
     std::visit(
         [&](auto&& x) {
             using T = std::decay_t<decltype(x)>;
-            from_sq = parse_square(x.from_name);
-            to_sq = parse_square(x.to_name);
+            from_sq = x.from_sq;
+            to_sq = x.to_sq;
             if constexpr (std::is_same_v<T, DeployMove>) {
                 has_deploy = true;
                 deploy_count = x.deploy_count;
             } else if constexpr (std::is_same_v<T, ChargeMove>) {
-                has_capture = x.capture.has_value();
-                if (x.waypoints) wps = *x.waypoints;
+                has_capture = x.capture_sq >= 0;
+                if (x.has_waypoints) wps = x.waypoints;
                 if (x.demotions_required) {
                     has_dem = true;
                     dem_req = *x.demotions_required;
                 }
             } else if constexpr (std::is_same_v<T, ChainMove>) {
-                has_capture = x.capture.has_value();
-                if (x.waypoints) wps = *x.waypoints;
+                has_capture = x.capture_sq >= 0;
+                if (x.has_waypoints) wps = x.waypoints;
             }
         },
         mv);
@@ -103,7 +103,7 @@ inline WhiteMove white_apply_of(const WCandidate& c) {
     mv.to_sq = c.to_sq;
     mv.piece = c.piece;
     mv.has_promotion = c.promotion.has_value();
-    if (mv.has_promotion) mv.promotion = wpiece_from_name(*c.promotion);
+    if (mv.has_promotion) mv.promotion = *c.promotion;
     mv.capture_sq = c.capture_sq;  // -1 == none
     if (c.is_castling) {
         mv.is_castling = true;
@@ -121,10 +121,12 @@ inline std::vector<float> white_encode(const ChesskersNet& net, const WCandidate
     const int from_sq = c.from_sq;
     const int to_sq = alt ? c.castling_rook_sq : c.to_sq;
     const bool has_capture = c.capture_sq >= 0;
-    const std::string promo = c.promotion.value_or("");  // full word -> promo index 0
+    // The historical dict carried the full promotion word ("queen"...), which
+    // never matched promo_index's single-char codes -> index 0 always. Pass ""
+    // to preserve that exactly.
     if (net.is_v2)
-        return encode_move_v2(from_sq, to_sq, {}, has_capture, false, 0, false, 0, promo);
-    return encode_move(from_sq, to_sq, has_capture, {}, false, 0, false, 0, promo);
+        return encode_move_v2(from_sq, to_sq, {}, has_capture, false, 0, false, 0, "");
+    return encode_move(from_sq, to_sq, has_capture, {}, false, 0, false, 0, "");
 }
 
 // -------- NativeMove dispatch (apply / encode) --------

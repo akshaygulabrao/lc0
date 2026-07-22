@@ -97,6 +97,26 @@ struct JsonObj {
         }
         o += ']';
     }
+    // coord10 bytes -> 2-char key strings (byte-identical to the old stored keys).
+    void key_arr(const char* k, const std::vector<uint8_t>& v) {
+        key(k);
+        o += '[';
+        for (size_t j = 0; j < v.size(); ++j) {
+            if (j) o += ',';
+            json_escape(o, key_str(v[j]));
+        }
+        o += ']';
+    }
+    // 8x8 square bytes -> square names.
+    void sq_arr(const char* k, const std::vector<uint8_t>& v) {
+        key(k);
+        o += '[';
+        for (size_t j = 0; j < v.size(); ++j) {
+            if (j) o += ',';
+            json_escape(o, square_name(v[j]));
+        }
+        o += ']';
+    }
     void int_arr(const char* k, const std::vector<int>& v) {
         key(k);
         o += '[';
@@ -122,7 +142,7 @@ inline void white_move_json(std::string& o, const WCandidate& c) {
     else j.null("capture");
     j.null("waypoints");
     j.null("chainHops");
-    if (c.promotion) j.s("promotion", *c.promotion);
+    if (c.promotion) j.s("promotion", wpiece_name(*c.promotion));
     else j.null("promotion");
     j.null("demotedKings");
     j.null("demotionsRequired");
@@ -149,14 +169,13 @@ inline void white_castling_alt_json(std::string& o, const WCandidate& c) {
     j.end();
 }
 
-inline void simple_move_json(std::string& o, const std::string& uci, const std::string& from,
-                             const std::string& to, const std::string& piece, bool has_deploy,
-                             int deploy_count) {
+inline void simple_move_json(std::string& o, const std::string& uci, int from_sq, int to_sq,
+                             bool is_king, bool has_deploy, int deploy_count) {
     JsonObj j(o);
     j.s("uci", uci);
-    j.s("from", from);
-    j.s("to", to);
-    j.s("piece", piece);
+    j.s("from", square_name(from_sq));
+    j.s("to", square_name(to_sq));
+    j.s("piece", is_king ? "king" : "pawn");
     j.s("color", "black");
     j.null("capture");
     j.null("waypoints");
@@ -173,13 +192,13 @@ inline void simple_move_json(std::string& o, const std::string& uci, const std::
 inline void charge_json(std::string& o, const ChargeMove& c) {
     JsonObj j(o);
     j.s("uci", c.uci);
-    j.s("from", c.from_name);
-    j.s("to", c.to_name);
-    j.s("piece", c.piece);
+    j.s("from", square_name(c.from_sq));
+    j.s("to", square_name(c.to_sq));
+    j.s("piece", c.is_king ? "king" : "pawn");
     j.s("color", "black");
-    if (c.capture) j.s("capture", *c.capture);
+    if (c.capture_sq >= 0) j.s("capture", square_name(c.capture_sq));
     else j.null("capture");
-    if (c.waypoints) j.str_arr("waypoints", *c.waypoints);
+    if (c.has_waypoints) j.key_arr("waypoints", c.waypoints);
     else j.null("waypoints");
     j.null("chainHops");
     j.null("promotion");
@@ -196,21 +215,21 @@ inline void charge_json(std::string& o, const ChargeMove& c) {
 inline void chain_json(std::string& o, const ChainMove& m) {
     JsonObj j(o);
     j.s("uci", m.uci);
-    j.s("from", m.from_name);
-    j.s("to", m.to_name);
-    j.s("piece", m.piece);
+    j.s("from", square_name(m.from_sq));
+    j.s("to", square_name(m.to_sq));
+    j.s("piece", m.is_king ? "king" : "pawn");
     j.s("color", "black");
-    if (m.capture) j.s("capture", *m.capture);
+    if (m.capture_sq >= 0) j.s("capture", square_name(m.capture_sq));
     else j.null("capture");
-    if (m.waypoints) j.str_arr("waypoints", *m.waypoints);
+    if (m.has_waypoints) j.key_arr("waypoints", m.waypoints);
     else j.null("waypoints");
-    j.str_arr("chainHops", m.chain_hops);
+    j.key_arr("chainHops", m.chain_hops);
     j.null("promotion");
     j.null("demotedKings");
     j.null("demotionsRequired");
     j.null("sourceKingPositions");
     j.null("deployCount");
-    j.str_arr("_chain_all_captures", m.chain_all_captures);
+    j.sq_arr("_chain_all_captures", m.chain_all_captures);
     j.i("cadence", m.cadence);
     j.b("_is_suicide", m.is_suicide);
     j.b("_chain_promotes", m.chain_promotes);
@@ -227,9 +246,9 @@ inline void native_move_json(std::string& o, const NativeMove& m) {
         [&](auto&& x) {
             using T = std::decay_t<decltype(x)>;
             if constexpr (std::is_same_v<T, QuietMove>)
-                simple_move_json(o, x.uci, x.from_name, x.to_name, x.piece, false, 0);
+                simple_move_json(o, x.uci, x.from_sq, x.to_sq, x.is_king, false, 0);
             else if constexpr (std::is_same_v<T, DeployMove>)
-                simple_move_json(o, x.uci, x.from_name, x.to_name, x.piece, true, x.deploy_count);
+                simple_move_json(o, x.uci, x.from_sq, x.to_sq, x.is_king, true, x.deploy_count);
             else if constexpr (std::is_same_v<T, ChargeMove>)
                 charge_json(o, x);
             else

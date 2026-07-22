@@ -47,23 +47,11 @@ inline const char* wpiece_name(WPiece p) {
     return "?";
 }
 
-// Inverse of wpiece_name: piece word -> WPiece (default King, matching the
-// bindings' historical fallback). Used by both the dict parse and the pure
-// WCandidate->WhiteMove converter.
-inline WPiece wpiece_from_name(const std::string& n) {
-    if (n == "pawn") return WPiece::Pawn;
-    if (n == "knight") return WPiece::Knight;
-    if (n == "bishop") return WPiece::Bishop;
-    if (n == "rook") return WPiece::Rook;
-    if (n == "queen") return WPiece::Queen;
-    return WPiece::King;
-}
-
 struct WCandidate {
     int from_sq, to_sq;
     WPiece piece;
-    std::optional<std::string> promotion;  // "queen"/"rook"/"bishop"/"knight"
-    int capture_sq;                        // -1 == none
+    std::optional<WPiece> promotion;  // Queen/Rook/Bishop/Knight
+    int capture_sq;                   // -1 == none
     bool is_en_passant;
     bool is_castling;
     bool castling_kingside;  // valid iff is_castling
@@ -226,7 +214,8 @@ inline std::vector<WCandidate> white_pseudo_legal(const WhiteBoard& b) {
     white_castling_pseudo(b, out);
 
     const uint64_t pawns_w = b.pawns & own;
-    static const char* PROMOS[4] = {"queen", "rook", "bishop", "knight"};
+    static constexpr WPiece PROMOS[4] = {WPiece::Queen, WPiece::Rook, WPiece::Bishop,
+                                         WPiece::Knight};
     // Captures (incl. promotions).
     uint64_t pw = pawns_w;
     while (pw) {
@@ -239,9 +228,9 @@ inline std::vector<WCandidate> white_pseudo_legal(const WhiteBoard& b) {
             const int s = sq_idx(nf, nr);
             if (!(enemy & (1ULL << s))) continue;
             if (nr == 7)
-                for (const char* p : PROMOS)
+                for (const WPiece p : PROMOS)
                     out.push_back(
-                        WCandidate{from, s, WPiece::Pawn, std::string(p), s, false, false, false, 0});
+                        WCandidate{from, s, WPiece::Pawn, p, s, false, false, false, 0});
             else
                 out.push_back(
                     WCandidate{from, s, WPiece::Pawn, std::nullopt, s, false, false, false, 0});
@@ -256,9 +245,9 @@ inline std::vector<WCandidate> white_pseudo_legal(const WhiteBoard& b) {
         sm &= sm - 1;
         const int from = to - 8;
         if ((to >> 3) == 7)
-            for (const char* p : PROMOS)
+            for (const WPiece p : PROMOS)
                 out.push_back(
-                    WCandidate{from, to, WPiece::Pawn, std::string(p), -1, false, false, false, 0});
+                    WCandidate{from, to, WPiece::Pawn, p, -1, false, false, false, 0});
         else
             out.push_back(
                 WCandidate{from, to, WPiece::Pawn, std::nullopt, -1, false, false, false, 0});
@@ -345,8 +334,13 @@ inline std::vector<WCandidate> white_legal_moves(const WhiteBoard& b,
 inline std::string white_uci(const WCandidate& c) {
     std::string s = square_name(c.from_sq) + square_name(c.to_sq);
     if (c.promotion) {
-        const std::string& p = *c.promotion;
-        s += (p == "queen") ? 'q' : (p == "rook") ? 'r' : (p == "bishop") ? 'b' : (p == "knight") ? 'n' : '?';
+        switch (*c.promotion) {
+            case WPiece::Queen: s += 'q'; break;
+            case WPiece::Rook: s += 'r'; break;
+            case WPiece::Bishop: s += 'b'; break;
+            case WPiece::Knight: s += 'n'; break;
+            default: s += '?'; break;
+        }
     }
     return s;
 }
