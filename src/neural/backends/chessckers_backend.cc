@@ -59,6 +59,22 @@ using EvalBatchResult = std::vector<std::pair<float, std::vector<float>>>;
 // The cross-game coalescer never merges past this many positions into one batch.
 constexpr size_t kCoalesceMaxBatch = 1024;
 
+// One gathered eval input (see ChesskersComputation::AddInput). Board went POD
+// in the 2026-07 stacks refactor, so an Item is ~1KB and a full
+// kCoalesceMaxBatch AtomicVector is ~1MB — allocated per COMPUTATION, i.e.
+// hundreds of times per second under GPU search. Those buffers are pooled on
+// the backend (AcquireItems/ReleaseItems) instead of heap-cycled: glibc's
+// dynamic mmap threshold otherwise adapts past 1MB and the freed buffers are
+// retained in the arenas (~165MB/s RSS growth), while pinning the threshold
+// (see main.cc) makes each allocation a fresh zero-filled mmap — a measurable
+// page-fault tax. Reuse avoids both.
+struct Item {
+    ChessBoard board;
+    MoveList moves;
+    EvalResultPtr out;
+};
+using ItemVec = AtomicVector<Item>;
+
 class ChesskersBackend : public Backend {
  public:
   explicit ChesskersBackend(const OptionsDict& options)
@@ -268,6 +284,30 @@ class ChesskersBackend : public Backend {
   mutable std::deque<CoalesceSub*> coalesce_queue_;
   mutable bool coalesce_processing_ = false;
 
+ public:
+  // Item-buffer pool (see the Item comment above). const because computations
+  // hold a const backend ref; the pool is mutable like the GPU mutexes.
+  std::unique_ptr<ItemVec> AcquireItems() const {
+    {
+      std::lock_guard<std::mutex> lk(pool_mu_);
+      if (!item_pool_.empty()) {
+        auto v = std::move(item_pool_.back());
+        item_pool_.pop_back();
+        return v;
+      }
+    }
+    return std::make_unique<ItemVec>(kCoalesceMaxBatch);
+  }
+  void ReleaseItems(std::unique_ptr<ItemVec> v) const {
+    v->clear();
+    std::lock_guard<std::mutex> lk(pool_mu_);
+    item_pool_.push_back(std::move(v));
+  }
+
+ private:
+  mutable std::mutex pool_mu_;
+  mutable std::vector<std::unique_ptr<ItemVec>> item_pool_;
+
   cc::ChesskersNet net_;
 #ifdef CC_HAVE_METAL
   std::unique_ptr<cc::MetalTrunkV2> metal_;
@@ -282,9 +322,11 @@ class ChesskersBackend : public Backend {
 class ChesskersComputation : public BackendComputation {
  public:
   explicit ChesskersComputation(const ChesskersBackend& backend)
-      : backend_(backend), items_(kCoalesceMaxBatch) {}
+      : backend_(backend), items_(backend.AcquireItems()) {}
 
-  size_t UsedBatchSize() const override { return items_.size(); }
+  ~ChesskersComputation() override { backend_.ReleaseItems(std::move(items_)); }
+
+  size_t UsedBatchSize() const override { return items_->size(); }
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
@@ -297,12 +339,12 @@ class ChesskersComputation : public BackendComputation {
     item.board = pos.pos.back().GetBoard();
     item.moves.assign(pos.legal_moves.begin(), pos.legal_moves.end());
     item.out = result;
-    items_.emplace_back(std::move(item));
+    items_->emplace_back(std::move(item));
     return ENQUEUED_FOR_EVAL;
   }
 
   void ComputeBlocking() override {
-    const size_t k = items_.size();
+    const size_t k = items_->size();
     if (k == 0) return;
     const cc::ChesskersNet& net = backend_.net();
 
@@ -310,7 +352,7 @@ class ChesskersComputation : public BackendComputation {
     std::vector<std::vector<std::vector<float>>> moves_per;
     positions.reserve(k);
     moves_per.reserve(k);
-    for (const auto& item : items_) {
+    for (const auto& item : *items_) {
       positions.push_back(net.is_v2 ? cc::encode_position_v2(item.board.cc())
                                     : cc::encode_position(item.board.cc()));
       std::vector<std::vector<float>> menc;
@@ -330,26 +372,21 @@ class ChesskersComputation : public BackendComputation {
     for (size_t i = 0; i < k; ++i) {
       const float value = results[i].first;
       const std::vector<float>& priors = results[i].second;
-      EvalResultPtr& out = items_[i].out;
+      EvalResultPtr& out = (*items_)[i].out;
       if (out.q) *out.q = value;
       if (out.d) *out.d = 0.0f;  // has_wdl=false
       if (out.m) *out.m = (want_mlh && i < mls.size()) ? mls[i] : 0.0f;
       const size_t n = std::min(priors.size(), out.p.size());
       for (size_t j = 0; j < n; ++j) out.p[j] = priors[j];
     }
-    items_.clear();
+    items_->clear();
   }
 
  private:
-  struct Item {
-    ChessBoard board;
-    MoveList moves;
-    EvalResultPtr out;
-  };
   const ChesskersBackend& backend_;
-  // Capacity = kCoalesceMaxBatch = the advertised maximum_batch_size: the search
-  // never gathers more inputs than that into one computation.
-  AtomicVector<Item> items_;
+  // Pooled; capacity = kCoalesceMaxBatch = the advertised maximum_batch_size:
+  // the search never gathers more inputs than that into one computation.
+  std::unique_ptr<ItemVec> items_;
 };
 
 std::unique_ptr<BackendComputation> ChesskersBackend::CreateComputation() {
