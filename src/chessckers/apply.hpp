@@ -194,6 +194,11 @@ inline void apply_black_move(Board& b, const BlackMove& mv) {
     else if (mv.has_capture) apply_diagonal_capture(b, mv);
     else apply_quiet_or_sprint(b, mv);
     b.turn_white = true;
+    // Standard FEN semantics (mirrors moves_black.py): the fullmove number
+    // advances when Black completes a move. Landed 2026-07-16 in PyVariant (a
+    // frozen counter pinned UCI-driven temperature decay at move 0); mirrored
+    // here 2026-07-22 when the regenerated parity corpus exposed the gap.
+    b.fullmove += 1;
     // Rank-8 counter (#3): a check from Black at any point resets it to 0.
     if (b.rank8_count != 0) {
         const uint64_t wk_bb = b.kings & b.occupied_white;
