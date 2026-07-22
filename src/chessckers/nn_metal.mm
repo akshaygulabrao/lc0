@@ -233,6 +233,148 @@ MPSGraphTensor* transformerBlock(MPSGraph* g, MPSGraphTensor* x, int C, int Hn, 
     return [g reshapeTensor:back withShape:@[ @(-1), @(C), @10, @10 ] name:nil];
 }
 
+// The head subgraph's external surface: move-data placeholders in, output tensors out.
+// mlz is the PRE-softplus moves-left scalar [K] (softplus runs on the host, matching the
+// CPU oracle's double-precision log1p/exp exactly on the head's output); nil when the
+// net has no moves-left head.
+struct HeadIO {
+    MPSGraphTensor* gfrom = nil;    // [-1] int32: board*100+from
+    MPSGraphTensor* gto = nil;      // [-1] int32: board*100+to
+    MPSGraphTensor* gboard = nil;   // [-1] int32: board index (path-mean gather)
+    MPSGraphTensor* pmask = nil;    // [-1,100] path mask
+    MPSGraphTensor* pdenom = nil;   // [-1,1] path-mean denominator
+    MPSGraphTensor* ptyp = nil;     // [-1,n_typ] type scalars
+    MPSGraphTensor* wdl = nil;      // value WDL logits [-1,1,3]
+    MPSGraphTensor* logits = nil;   // [-1] policy logits over the flattened M moves
+    MPSGraphTensor* mlz = nil;      // [-1] pre-softplus moves-left
+};
+
+// The V1/V2/V4 spatial trunk: conv+GN+ReLU stem, then pos-emb / SE-ResNet / transformer
+// blocks discovered from the WeightStore keys. Returns the feature map F [-1,C,10,10].
+MPSGraphTensor* buildTrunk(MPSGraph* g, MPSGraphTensor* x, const ChesskersNet& net) {
+    const auto& w = net.w;
+    const int C = net.c_filters, HW = 100;
+    x = convOp(g, x, w.at("position_trunk.0.weight"), C, net.c_in);
+    x = groupNorm(g, x, C, 8, HW, w.at("position_trunk.1.weight"), w.at("position_trunk.1.bias"));
+    x = [g reLUWithTensor:x name:nil];
+    for (int k = 3;; ++k) {
+        const std::string p = "position_trunk." + std::to_string(k) + ".";
+        if (w.tensors.count(p + "pos")) {
+            MPSGraphTensor* pe = constFrom(g, w.at(p + "pos"), @[ @1, @(C), @10, @10 ]);
+            x = [g additionWithPrimaryTensor:x secondaryTensor:pe name:nil];
+        } else if (w.tensors.count(p + "conv1.weight")) {
+            MPSGraphTensor* c1 = convOp(g, x, w.at(p + "conv1.weight"), C, C);
+            c1 = groupNorm(g, c1, C, 8, HW, w.at(p + "bn1.weight"), w.at(p + "bn1.bias"));
+            c1 = [g reLUWithTensor:c1 name:nil];
+            MPSGraphTensor* c2 = convOp(g, c1, w.at(p + "conv2.weight"), C, C);
+            c2 = groupNorm(g, c2, C, 8, HW, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"));
+            if (w.tensors.count(p + "se_fc1.weight")) {  // V4 Squeeze-Excitation
+                const int cr = (int)w.at(p + "se_fc1.bias").size();
+                MPSGraphTensor* se = [g meanOfTensor:c2 axes:@[ @2, @3 ] name:nil];   // [N,C,1,1]
+                se = [g reshapeTensor:se withShape:@[ @(-1), @1, @(C) ] name:nil];    // [N,1,C]
+                se = linearLast(g, se, w.at(p + "se_fc1.weight"), w.at(p + "se_fc1.bias"), cr, C);
+                se = [g reLUWithTensor:se name:nil];
+                se = linearLast(g, se, w.at(p + "se_fc2.weight"), w.at(p + "se_fc2.bias"), C, cr);
+                se = [g sigmoidWithTensor:se name:nil];                               // [N,1,C]
+                MPSGraphTensor* gate = [g reshapeTensor:se
+                                              withShape:@[ @(-1), @(C), @1, @1 ] name:nil];
+                c2 = [g multiplicationWithPrimaryTensor:c2 secondaryTensor:gate name:nil];
+            }
+            c2 = [g additionWithPrimaryTensor:c2 secondaryTensor:x name:nil];
+            x = [g reLUWithTensor:c2 name:nil];
+        } else if (w.tensors.count(p + "attn.in_proj_weight")) {
+            x = transformerBlock(g, x, C, net.n_heads, w, p);
+        } else {
+            break;
+        }
+    }
+    return x;
+}
+
+// The V2 heads off the feature map F: value WDL, the gather policy head, and (when the
+// net carries it) the moves-left head sharing the value_trunk embedding.
+HeadIO buildHeads(MPSGraph* gh, MPSGraphTensor* F, const ChesskersNet& net) {
+    const auto& w = net.w;
+    const int C = net.c_filters, dh = net.d_hidden;
+    HeadIO io;
+    MPSGraphTensor* pooled = [gh meanOfTensor:F axes:@[ @2, @3 ] name:nil];      // [K,C,1,1]
+    pooled = [gh reshapeTensor:pooled withShape:@[ @(-1), @1, @(C) ] name:nil];  // [K,1,C]
+    MPSGraphTensor* vt = linearLast(gh, pooled, w.at("value_trunk.0.weight"),
+                                    w.at("value_trunk.0.bias"), dh, C);
+    vt = layerNormLast(gh, vt, dh, w.at("value_trunk.1.weight"), w.at("value_trunk.1.bias"));
+    vt = [gh reLUWithTensor:vt name:nil];
+    MPSGraphTensor* v1 = linearLast(gh, vt, w.at("value_head.0.weight"),
+                                    w.at("value_head.0.bias"), dh / 2, dh);
+    v1 = layerNormLast(gh, v1, dh / 2, w.at("value_head.1.weight"), w.at("value_head.1.bias"));
+    v1 = [gh reLUWithTensor:v1 name:nil];
+    io.wdl = linearLast(gh, v1, w.at("value_head.3.weight"), w.at("value_head.3.bias"),
+                        3, dh / 2);  // [K,1,3]
+
+    // ---- moves-left head off the SHARED value_trunk embedding (nn.hpp moves_left_v2) ----
+    if (net.has_moves_left) {
+        MPSGraphTensor* m1 = linearLast(gh, vt, w.at("moves_left_head.0.weight"),
+                                        w.at("moves_left_head.0.bias"), dh / 2, dh);
+        m1 = layerNormLast(gh, m1, dh / 2, w.at("moves_left_head.1.weight"),
+                           w.at("moves_left_head.1.bias"));
+        m1 = [gh reLUWithTensor:m1 name:nil];
+        MPSGraphTensor* mz = linearLast(gh, m1, w.at("moves_left_head.3.weight"),
+                                        w.at("moves_left_head.3.bias"), 1, dh / 2);  // [K,1,1]
+        io.mlz = [gh reshapeTensor:mz withShape:@[ @(-1) ] name:nil];  // [K]
+    }
+
+    // ---- policy (gather) head, flattened over the M moves of all boards ----
+    const int ntyp = net.d_move - 102;
+    io.gfrom = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gfrom"];
+    io.gto = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gto"];
+    io.gboard = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gboard"];
+    io.pmask = [gh placeholderWithShape:@[ @(-1), @100 ] dataType:MPSDataTypeFloat32 name:@"pmask"];
+    io.pdenom = [gh placeholderWithShape:@[ @(-1), @1 ] dataType:MPSDataTypeFloat32 name:@"pdenom"];
+    io.ptyp = [gh placeholderWithShape:@[ @(-1), @(ntyp) ] dataType:MPSDataTypeFloat32 name:@"ptyp"];
+
+    // F -> token-major [K,100,C] (and flat [K*100,C]) for the gathers.
+    MPSGraphTensor* Fc = [gh reshapeTensor:F withShape:@[ @(-1), @(C), @100 ] name:nil];    // [K,C,100]
+    MPSGraphTensor* Ftok = [gh transposeTensor:Fc dimension:1 withDimension:2 name:nil];    // [K,100,C]
+    MPSGraphTensor* Fflat = [gh reshapeTensor:Ftok withShape:@[ @(-1), @(C) ] name:nil];    // [K*100,C]
+
+    // endpoint gathers -> [M,1,C]
+    MPSGraphTensor* FF = [gh gatherWithUpdatesTensor:Fflat indicesTensor:io.gfrom axis:0 batchDimensions:0 name:nil];
+    MPSGraphTensor* TF = [gh gatherWithUpdatesTensor:Fflat indicesTensor:io.gto axis:0 batchDimensions:0 name:nil];
+    FF = [gh reshapeTensor:FF withShape:@[ @(-1), @1, @(C) ] name:nil];
+    TF = [gh reshapeTensor:TF withShape:@[ @(-1), @1, @(C) ] name:nil];
+
+    // path-mean PF = (pmask @ F_board) / denom -> [M,1,C]
+    MPSGraphTensor* Fb = [gh gatherWithUpdatesTensor:Ftok indicesTensor:io.gboard axis:0 batchDimensions:0 name:nil];  // [M,100,C]
+    MPSGraphTensor* pm = [gh reshapeTensor:io.pmask withShape:@[ @(-1), @1, @100 ] name:nil];                          // [M,1,100]
+    MPSGraphTensor* PF = [gh matrixMultiplicationWithPrimaryTensor:pm secondaryTensor:Fb name:nil];                    // [M,1,C]
+    PF = [gh divisionWithPrimaryTensor:PF
+                       secondaryTensor:[gh reshapeTensor:io.pdenom withShape:@[ @(-1), @1, @1 ] name:nil]
+                                  name:nil];
+
+    // projections + ctx MLP + scaled dot
+    MPSGraphTensor* src = linearLast(gh, FF, w.at("src_proj.weight"), w.at("src_proj.bias"), dh, C);
+    MPSGraphTensor* tgt = linearLast(gh, TF, w.at("tgt_proj.weight"), w.at("tgt_proj.bias"), dh, C);
+    MPSGraphTensor* typ3 = [gh reshapeTensor:io.ptyp withShape:@[ @(-1), @1, @(ntyp) ] name:nil];
+    MPSGraphTensor* ctxin = [gh concatTensors:@[ FF, TF, PF, typ3 ] dimension:2 name:nil];  // [M,1,3C+ntyp]
+    MPSGraphTensor* h = linearLast(gh, ctxin, w.at("ctx_mlp.0.weight"), w.at("ctx_mlp.0.bias"),
+                                   dh, 3 * C + ntyp);
+    h = layerNormLast(gh, h, dh, w.at("ctx_mlp.1.weight"), w.at("ctx_mlp.1.bias"));
+    h = [gh reLUWithTensor:h name:nil];
+    MPSGraphTensor* ctx = linearLast(gh, h, w.at("ctx_mlp.3.weight"), w.at("ctx_mlp.3.bias"), 1, dh);  // [M,1,1]
+
+    MPSGraphTensor* dot = [gh reductionSumWithTensor:[gh multiplicationWithPrimaryTensor:src
+                                                                        secondaryTensor:tgt
+                                                                                   name:nil]
+                                               axis:2
+                                               name:nil];
+    dot = [gh reshapeTensor:dot withShape:@[ @(-1), @1, @1 ] name:nil];  // [M,1,1]
+    MPSGraphTensor* scl =
+        [gh constantWithScalar:1.0 / std::sqrt((double)dh) dataType:MPSDataTypeFloat32];
+    dot = [gh multiplicationWithPrimaryTensor:dot secondaryTensor:scl name:nil];
+    MPSGraphTensor* logit = [gh additionWithPrimaryTensor:dot secondaryTensor:ctx name:nil];  // [M,1,1]
+    io.logits = [gh reshapeTensor:logit withShape:@[ @(-1) ] name:nil];  // [M]
+    return io;
+}
+
 }  // namespace
 
 struct MetalTrunkV2::Impl {
@@ -247,17 +389,10 @@ struct MetalTrunkV2::Impl {
     // GPU value+policy heads (V2): a second cached graph fed the trunk's feature map F.
     bool heads_ok = false;
     int d_hidden = 256;
+    int n_typ = 12;               // trailing move type scalars (d_move-102)
     MPSGraph* gh = nil;
     MPSGraphTensor* hF = nil;     // F placeholder [-1,C,10,10]
-    MPSGraphTensor* hwdl = nil;   // value WDL logits [-1,1,3]
-    int n_typ = 12;              // trailing move type scalars (d_move-102)
-    MPSGraphTensor* hgfrom = nil;   // [-1] int32: board*100+from
-    MPSGraphTensor* hgto = nil;     // [-1] int32: board*100+to
-    MPSGraphTensor* hgboard = nil;  // [-1] int32: board index (path-mean gather)
-    MPSGraphTensor* hpmask = nil;   // [-1,100] path mask
-    MPSGraphTensor* hpdenom = nil;  // [-1,1] path-mean denominator
-    MPSGraphTensor* hptyp = nil;    // [-1,n_typ] type scalars
-    MPSGraphTensor* hlogits = nil;  // [-1] policy logits over the flattened M moves
+    HeadIO hio;
 };
 
 MetalTrunkV2::MetalTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>()) {
@@ -276,120 +411,25 @@ MetalTrunkV2::MetalTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>(
                                            dataType:MPSDataTypeFloat32
                                                name:@"pos"];
         p_->in = x;
-        x = convOp(g, x, w.at("position_trunk.0.weight"), C, net.c_in);
-        x = groupNorm(g, x, C, 8, HW, w.at("position_trunk.1.weight"), w.at("position_trunk.1.bias"));
-        x = [g reLUWithTensor:x name:nil];
-        for (int k = 3;; ++k) {
-            const std::string p = "position_trunk." + std::to_string(k) + ".";
-            if (w.tensors.count(p + "pos")) {
-                MPSGraphTensor* pe = constFrom(g, w.at(p + "pos"), @[ @1, @(C), @10, @10 ]);
-                x = [g additionWithPrimaryTensor:x secondaryTensor:pe name:nil];
-            } else if (w.tensors.count(p + "conv1.weight")) {
-                MPSGraphTensor* c1 = convOp(g, x, w.at(p + "conv1.weight"), C, C);
-                c1 = groupNorm(g, c1, C, 8, HW, w.at(p + "bn1.weight"), w.at(p + "bn1.bias"));
-                c1 = [g reLUWithTensor:c1 name:nil];
-                MPSGraphTensor* c2 = convOp(g, c1, w.at(p + "conv2.weight"), C, C);
-                c2 = groupNorm(g, c2, C, 8, HW, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"));
-                if (w.tensors.count(p + "se_fc1.weight")) {  // V4 Squeeze-Excitation
-                    const int cr = (int)w.at(p + "se_fc1.bias").size();
-                    MPSGraphTensor* se = [g meanOfTensor:c2 axes:@[ @2, @3 ] name:nil];   // [N,C,1,1]
-                    se = [g reshapeTensor:se withShape:@[ @(-1), @1, @(C) ] name:nil];    // [N,1,C]
-                    se = linearLast(g, se, w.at(p + "se_fc1.weight"), w.at(p + "se_fc1.bias"), cr, C);
-                    se = [g reLUWithTensor:se name:nil];
-                    se = linearLast(g, se, w.at(p + "se_fc2.weight"), w.at(p + "se_fc2.bias"), C, cr);
-                    se = [g sigmoidWithTensor:se name:nil];                               // [N,1,C]
-                    MPSGraphTensor* gate = [g reshapeTensor:se
-                                                  withShape:@[ @(-1), @(C), @1, @1 ] name:nil];
-                    c2 = [g multiplicationWithPrimaryTensor:c2 secondaryTensor:gate name:nil];
-                }
-                c2 = [g additionWithPrimaryTensor:c2 secondaryTensor:x name:nil];
-                x = [g reLUWithTensor:c2 name:nil];
-            } else if (w.tensors.count(p + "attn.in_proj_weight")) {
-                x = transformerBlock(g, x, C, net.n_heads, w, p);
-            } else {
-                break;
-            }
-        }
-        p_->out = x;
+        p_->out = buildTrunk(g, x, net);
         p_->ok = true;
+        (void)w; (void)HW;
 
-        // --- GPU heads (V2): a second graph, fed F, outputs the value WDL logits. The policy
-        // head (6e) is added to this graph next; until then priors stay on the CPU. ---
+        // --- GPU heads (V2): a second graph fed the trunk's F. Kept SEPARATE from the trunk
+        // graph on purpose: executables cache per feed-shape tuple, so the expensive-to-compile
+        // trunk keys only on the K bucket while this cheap graph absorbs the (K,M) combinations
+        // (a fused trunk+heads graph recompiled the convs for every new combo — measured 3×
+        // slower). eval_batch chains them GPU-side: the trunk result tensor feeds hF directly,
+        // so F never round-trips through the host. ---
         if (net.is_v2) {
-            const int dh = net.d_hidden;
-            p_->d_hidden = dh;
+            p_->d_hidden = net.d_hidden;
+            p_->n_typ = net.d_move - 102;
             MPSGraph* gh = [MPSGraph new];
             p_->gh = gh;
-            MPSGraphTensor* F = [gh placeholderWithShape:@[ @(-1), @(C), @10, @10 ]
-                                                dataType:MPSDataTypeFloat32
-                                                    name:@"F"];
-            p_->hF = F;
-            MPSGraphTensor* pooled = [gh meanOfTensor:F axes:@[ @2, @3 ] name:nil];      // [K,C,1,1]
-            pooled = [gh reshapeTensor:pooled withShape:@[ @(-1), @1, @(C) ] name:nil];  // [K,1,C]
-            MPSGraphTensor* vt = linearLast(gh, pooled, w.at("value_trunk.0.weight"),
-                                            w.at("value_trunk.0.bias"), dh, C);
-            vt = layerNormLast(gh, vt, dh, w.at("value_trunk.1.weight"), w.at("value_trunk.1.bias"));
-            vt = [gh reLUWithTensor:vt name:nil];
-            MPSGraphTensor* v1 = linearLast(gh, vt, w.at("value_head.0.weight"),
-                                            w.at("value_head.0.bias"), dh / 2, dh);
-            v1 = layerNormLast(gh, v1, dh / 2, w.at("value_head.1.weight"), w.at("value_head.1.bias"));
-            v1 = [gh reLUWithTensor:v1 name:nil];
-            p_->hwdl = linearLast(gh, v1, w.at("value_head.3.weight"), w.at("value_head.3.bias"),
-                                  3, dh / 2);  // [K,1,3]
-
-            // ---- policy (gather) head, flattened over the M moves of all boards ----
-            const int ntyp = net.d_move - 102;
-            p_->n_typ = ntyp;
-            MPSGraphTensor* gfrom = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gfrom"];
-            MPSGraphTensor* gto = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gto"];
-            MPSGraphTensor* gboard = [gh placeholderWithShape:@[ @(-1) ] dataType:MPSDataTypeInt32 name:@"gboard"];
-            MPSGraphTensor* pmask = [gh placeholderWithShape:@[ @(-1), @100 ] dataType:MPSDataTypeFloat32 name:@"pmask"];
-            MPSGraphTensor* pdenom = [gh placeholderWithShape:@[ @(-1), @1 ] dataType:MPSDataTypeFloat32 name:@"pdenom"];
-            MPSGraphTensor* ptyp = [gh placeholderWithShape:@[ @(-1), @(ntyp) ] dataType:MPSDataTypeFloat32 name:@"ptyp"];
-            p_->hgfrom = gfrom; p_->hgto = gto; p_->hgboard = gboard;
-            p_->hpmask = pmask; p_->hpdenom = pdenom; p_->hptyp = ptyp;
-
-            // F -> token-major [K,100,C] (and flat [K*100,C]) for the gathers.
-            MPSGraphTensor* Fc = [gh reshapeTensor:F withShape:@[ @(-1), @(C), @100 ] name:nil];    // [K,C,100]
-            MPSGraphTensor* Ftok = [gh transposeTensor:Fc dimension:1 withDimension:2 name:nil];    // [K,100,C]
-            MPSGraphTensor* Fflat = [gh reshapeTensor:Ftok withShape:@[ @(-1), @(C) ] name:nil];    // [K*100,C]
-
-            // endpoint gathers -> [M,1,C]
-            MPSGraphTensor* FF = [gh gatherWithUpdatesTensor:Fflat indicesTensor:gfrom axis:0 batchDimensions:0 name:nil];
-            MPSGraphTensor* TF = [gh gatherWithUpdatesTensor:Fflat indicesTensor:gto axis:0 batchDimensions:0 name:nil];
-            FF = [gh reshapeTensor:FF withShape:@[ @(-1), @1, @(C) ] name:nil];
-            TF = [gh reshapeTensor:TF withShape:@[ @(-1), @1, @(C) ] name:nil];
-
-            // path-mean PF = (pmask @ F_board) / denom -> [M,1,C]
-            MPSGraphTensor* Fb = [gh gatherWithUpdatesTensor:Ftok indicesTensor:gboard axis:0 batchDimensions:0 name:nil];  // [M,100,C]
-            MPSGraphTensor* pm = [gh reshapeTensor:pmask withShape:@[ @(-1), @1, @100 ] name:nil];                          // [M,1,100]
-            MPSGraphTensor* PF = [gh matrixMultiplicationWithPrimaryTensor:pm secondaryTensor:Fb name:nil];                 // [M,1,C]
-            PF = [gh divisionWithPrimaryTensor:PF
-                               secondaryTensor:[gh reshapeTensor:pdenom withShape:@[ @(-1), @1, @1 ] name:nil]
-                                          name:nil];
-
-            // projections + ctx MLP + scaled dot
-            MPSGraphTensor* src = linearLast(gh, FF, w.at("src_proj.weight"), w.at("src_proj.bias"), dh, C);
-            MPSGraphTensor* tgt = linearLast(gh, TF, w.at("tgt_proj.weight"), w.at("tgt_proj.bias"), dh, C);
-            MPSGraphTensor* typ3 = [gh reshapeTensor:ptyp withShape:@[ @(-1), @1, @(ntyp) ] name:nil];
-            MPSGraphTensor* ctxin = [gh concatTensors:@[ FF, TF, PF, typ3 ] dimension:2 name:nil];  // [M,1,3C+ntyp]
-            MPSGraphTensor* h = linearLast(gh, ctxin, w.at("ctx_mlp.0.weight"), w.at("ctx_mlp.0.bias"),
-                                           dh, 3 * C + ntyp);
-            h = layerNormLast(gh, h, dh, w.at("ctx_mlp.1.weight"), w.at("ctx_mlp.1.bias"));
-            h = [gh reLUWithTensor:h name:nil];
-            MPSGraphTensor* ctx = linearLast(gh, h, w.at("ctx_mlp.3.weight"), w.at("ctx_mlp.3.bias"), 1, dh);  // [M,1,1]
-
-            MPSGraphTensor* dot = [gh reductionSumWithTensor:[gh multiplicationWithPrimaryTensor:src
-                                                                                secondaryTensor:tgt
-                                                                                           name:nil]
-                                                       axis:2
-                                                       name:nil];
-            dot = [gh reshapeTensor:dot withShape:@[ @(-1), @1, @1 ] name:nil];  // [M,1,1]
-            MPSGraphTensor* scl =
-                [gh constantWithScalar:1.0 / std::sqrt((double)dh) dataType:MPSDataTypeFloat32];
-            dot = [gh multiplicationWithPrimaryTensor:dot secondaryTensor:scl name:nil];
-            MPSGraphTensor* logit = [gh additionWithPrimaryTensor:dot secondaryTensor:ctx name:nil];  // [M,1,1]
-            p_->hlogits = [gh reshapeTensor:logit withShape:@[ @(-1) ] name:nil];  // [M]
+            p_->hF = [gh placeholderWithShape:@[ @(-1), @(C), @10, @10 ]
+                                     dataType:MPSDataTypeFloat32
+                                         name:@"F"];
+            p_->hio = buildHeads(gh, p_->hF, net);
 
             // CC_CPU_HEADS=1 forces the CPU value/gather heads (the pre-GPU-heads path) — for
             // A/B benchmarking and as an escape hatch if a GPU-head issue ever surfaces.
@@ -440,13 +480,12 @@ std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_batch(
     std::vector<float>* m_out) const {
     const int K = (int)positions.size();
     std::vector<std::pair<float, std::vector<float>>> out(K);
-    if (!p_->ok || !p_->net) return out;
+    if (!p_->ok || !p_->net || K == 0) return out;
     const ChesskersNet& net = *p_->net;
-    const auto Fs = run(positions);  // GPU trunk (cached graph) -> F downloaded to the host
-    if (p_->heads_ok) {
-        out = eval_heads_from_F(Fs, moves_per);  // GPU value+policy heads
-    } else {
-        // Fallback (no V2 head graph): CPU value/gather heads.
+
+    if (!p_->heads_ok) {
+        // Fallback (CC_CPU_HEADS / no V2 head graph): GPU trunk, CPU value/gather heads.
+        const auto Fs = run(positions);
         for (int k = 0; k < K; ++k) {
             const float v = net.value_v2(Fs[k]);
             const int N = (int)moves_per[k].size();
@@ -454,12 +493,94 @@ std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_batch(
             const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
             out[k] = {v, softmax_priors(logits.data(), N)};
         }
+        if (m_out && net.has_moves_left) {
+            m_out->resize(K);
+            for (int k = 0; k < K; ++k) (*m_out)[k] = net.moves_left_v2(Fs[k]);
+        }
+        return out;
     }
-    // Moves-left head on the host from the already-downloaded F (the GPU head graph emits only
-    // value+policy; the head is two tiny matmuls). Bit-identical to the CPU oracle.
-    if (m_out && net.has_moves_left) {
-        m_out->resize(K);
-        for (int k = 0; k < K; ++k) (*m_out)[k] = net.moves_left_v2(Fs[k]);
+
+    // Production path: trunk submission, then heads submission fed the trunk's GPU-resident
+    // result tensor — F never touches the host. Feed shapes bucketed (see shapeBucket); the
+    // head target set is fixed so bucketed shapes stay the only executable-cache dimension.
+    @autoreleasepool {
+        const int Cin = p_->c_in, HW = 100;
+        auto mkData = [&](const void* bytes, size_t len, NSArray<NSNumber*>* shape,
+                          MPSDataType dt) -> MPSGraphTensorData* {
+            id<MTLBuffer> b = [p_->dev newBufferWithBytes:bytes
+                                                   length:len
+                                                  options:MTLResourceStorageModeShared];
+            return [[MPSGraphTensorData alloc] initWithMTLBuffer:b shape:shape dataType:dt];
+        };
+        const int Kb = shapeBucket(K);
+        std::vector<float> flat((size_t)Kb * Cin * HW, 0.0f);
+        for (int k = 0; k < K; ++k)
+            std::copy(positions[k].begin(), positions[k].end(), &flat[(size_t)k * Cin * HW]);
+        MPSGraphTensorData* dpos = mkData(flat.data(), flat.size() * sizeof(float),
+                                          @[ @(Kb), @(Cin), @10, @10 ], MPSDataTypeFloat32);
+        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* tres =
+            [p_->g runWithMTLCommandQueue:p_->q
+                                    feeds:@{p_->in : dpos}
+                            targetTensors:@[ p_->out ]
+                         targetOperations:nil];
+        MPSGraphTensorData* dF = tres[p_->out];  // [Kb,C,10,10], stays on the GPU
+
+        const FlatMoves fm = flatten_moves(moves_per, net.d_move);
+        const int M = fm.M, ntyp = fm.n_typ;
+        // Mb >= 8 even at M == 0: dummy rows (gather idx 0, denom 1) keep the feed set —
+        // and thus the executable-cache key — identical for terminal-only batches.
+        const int Mb = shapeBucket(M);
+        std::vector<int32_t> gfrom((size_t)Mb, 0), gto((size_t)Mb, 0), gboard((size_t)Mb, 0);
+        for (int i = 0; i < M; ++i) {
+            gfrom[i] = fm.board_of[i] * 100 + fm.from_idx[i];
+            gto[i] = fm.board_of[i] * 100 + fm.to_idx[i];
+            gboard[i] = fm.board_of[i];
+        }
+        std::vector<float> pmask((size_t)Mb * 100, 0.0f), pden((size_t)Mb, 1.0f),
+            ptyp((size_t)Mb * ntyp, 0.0f);
+        std::copy(fm.pathmask.begin(), fm.pathmask.end(), pmask.begin());
+        std::copy(fm.denom.begin(), fm.denom.end(), pden.begin());
+        std::copy(fm.typ.begin(), fm.typ.end(), ptyp.begin());
+
+        const HeadIO& io = p_->hio;
+        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{
+            p_->hF : dF,
+            io.gfrom : mkData(gfrom.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+            io.gto : mkData(gto.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+            io.gboard : mkData(gboard.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+            io.pmask : mkData(pmask.data(), (size_t)Mb * 100 * 4, @[ @(Mb), @100 ], MPSDataTypeFloat32),
+            io.pdenom : mkData(pden.data(), (size_t)Mb * 4, @[ @(Mb), @1 ], MPSDataTypeFloat32),
+            io.ptyp : mkData(ptyp.data(), (size_t)Mb * ntyp * 4, @[ @(Mb), @(ntyp) ], MPSDataTypeFloat32),
+        };
+        NSArray<MPSGraphTensor*>* targets = io.mlz ? @[ io.wdl, io.logits, io.mlz ]
+                                                   : @[ io.wdl, io.logits ];
+        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
+            [p_->gh runWithMTLCommandQueue:p_->q
+                                     feeds:feeds
+                             targetTensors:targets
+                          targetOperations:nil];
+        std::vector<float> wdl((size_t)Kb * 3), logits((size_t)Mb);
+        [[res[io.wdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
+        [[res[io.logits] mpsndarray] readBytes:logits.data() strideBytes:nil];
+
+        for (int k = 0; k < K; ++k) {
+            const float* z = &wdl[(size_t)k * 3];
+            const float mx = std::max({z[0], z[1], z[2]});
+            const double e0 = std::exp(z[0] - mx), e1 = std::exp(z[1] - mx), e2 = std::exp(z[2] - mx);
+            const float v = static_cast<float>((e0 - e2) / (e0 + e1 + e2));
+            const int lo = fm.board_off[k], n = fm.board_off[k + 1] - lo;
+            out[k] = {v, (n > 0) ? softmax_priors(&logits[lo], n) : std::vector<float>()};
+        }
+        if (m_out && net.has_moves_left && io.mlz) {
+            std::vector<float> mlz((size_t)Kb);
+            [[res[io.mlz] mpsndarray] readBytes:mlz.data() strideBytes:nil];
+            m_out->resize(K);
+            for (int k = 0; k < K; ++k) {
+                // Softplus on the host — same formula (and double math) as the CPU oracle.
+                const double z = mlz[k];
+                (*m_out)[k] = (float)(z > 20.0 ? z : std::log1p(std::exp(z)));
+            }
+        }
     }
     return out;
 }
@@ -513,28 +634,28 @@ std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_heads_from_
             std::copy(fm.typ.begin(), fm.typ.end(), ptyp.begin());
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{
                 p_->hF : dF,
-                p_->hgfrom : mkData(gfrom.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
-                p_->hgto : mkData(gto.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
-                p_->hgboard : mkData(gboard.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
-                p_->hpmask : mkData(pmask.data(), (size_t)Mb * 100 * 4, @[ @(Mb), @100 ], MPSDataTypeFloat32),
-                p_->hpdenom : mkData(pden.data(), (size_t)Mb * 4, @[ @(Mb), @1 ], MPSDataTypeFloat32),
-                p_->hptyp : mkData(ptyp.data(), (size_t)Mb * ntyp * 4, @[ @(Mb), @(ntyp) ], MPSDataTypeFloat32),
+                p_->hio.gfrom : mkData(gfrom.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hio.gto : mkData(gto.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hio.gboard : mkData(gboard.data(), (size_t)Mb * 4, @[ @(Mb) ], MPSDataTypeInt32),
+                p_->hio.pmask : mkData(pmask.data(), (size_t)Mb * 100 * 4, @[ @(Mb), @100 ], MPSDataTypeFloat32),
+                p_->hio.pdenom : mkData(pden.data(), (size_t)Mb * 4, @[ @(Mb), @1 ], MPSDataTypeFloat32),
+                p_->hio.ptyp : mkData(ptyp.data(), (size_t)Mb * ntyp * 4, @[ @(Mb), @(ntyp) ], MPSDataTypeFloat32),
             };
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
                 [p_->gh runWithMTLCommandQueue:p_->q
                                          feeds:feeds
-                                 targetTensors:@[ p_->hwdl, p_->hlogits ]
+                                 targetTensors:@[ p_->hio.wdl, p_->hio.logits ]
                               targetOperations:nil];
-            [[res[p_->hwdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
+            [[res[p_->hio.wdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
             logits.resize(Mb);
-            [[res[p_->hlogits] mpsndarray] readBytes:logits.data() strideBytes:nil];
+            [[res[p_->hio.logits] mpsndarray] readBytes:logits.data() strideBytes:nil];
         } else {
             NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res =
                 [p_->gh runWithMTLCommandQueue:p_->q
                                          feeds:@{p_->hF : dF}
-                                 targetTensors:@[ p_->hwdl ]
+                                 targetTensors:@[ p_->hio.wdl ]
                               targetOperations:nil];
-            [[res[p_->hwdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
+            [[res[p_->hio.wdl] mpsndarray] readBytes:wdl.data() strideBytes:nil];
         }
 
         for (int k = 0; k < K; ++k) {
