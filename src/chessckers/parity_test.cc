@@ -12,10 +12,15 @@
 // Standalone on purpose (plain main() + counters, no gtest): the stock lc0 gtest
 // suite (board_test.cc, ...) tests FIDE chess, which this fork does not play, so
 // it is not built or reused here. Run as:
-//   parity_test <path-to-parity_corpus.jsonl>
+//   parity_test <path-to-parity_corpus.jsonl> [bench_loops]
+// With bench_loops > 0, after the parity pass it re-runs gen_legal_native over
+// the whole (pre-parsed) corpus that many times and prints positions/sec —
+// a CPU-bound movegen benchmark with parse/IO excluded from the timed region.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -46,6 +51,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    const int bench_loops = (argc >= 3) ? std::atoi(argv[2]) : 0;
+    std::vector<Board> boards;
+
     int checked = 0;
     int gen_mismatch = 0;
     int status_mismatch = 0;
@@ -70,6 +78,7 @@ int main(int argc, char** argv) {
         }
 
         const Board b = parse_fen(fen);
+        if (bench_loops > 0) boards.push_back(b);
 
         // (a) legal move set: collect every generated uci, sort, compare for exact equality.
         std::vector<std::string> got;
@@ -108,5 +117,17 @@ int main(int argc, char** argv) {
 
     printf("checked %d: gen_mismatch=%d status_mismatch=%d\n", checked, gen_mismatch,
            status_mismatch);
+
+    if (bench_loops > 0) {
+        size_t total_moves = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int l = 0; l < bench_loops; ++l)
+            for (const Board& b : boards) total_moves += gen_legal_native(b).size();
+        const double secs = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        const double pos = (double)bench_loops * boards.size();
+        printf("bench: %d loops x %zu positions = %.0f pos/s (%.2fs, %zu moves)\n",
+               bench_loops, boards.size(), pos / secs, secs, total_moves);
+    }
     return (gen_mismatch || status_mismatch) ? 1 : 0;
 }

@@ -13,12 +13,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
-#include <map>
 #include <optional>
-#include <set>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -65,6 +63,34 @@ inline int owner(uint64_t occupied, uint64_t occupied_white, int sq) {
     return SQ_BLACK;
 }
 
+// Fixed-capacity inline vector: POD when T is POD, so copies are memcpy and no
+// call in the movegen hot path touches the heap (the 07-23 profile showed the
+// rules layer's remaining CPU was vector churn). Capacities are geometry
+// bounds, checked in debug via assert-free hard cap (writes beyond N would be
+// a rules-invariant violation; see call-site comments).
+template <typename T, int N>
+struct SmallVec {
+    T v[N];
+    int n = 0;
+    void push_back(const T& x) { v[n++] = x; }
+    void pop_back() { --n; }
+    int size() const { return n; }
+    bool empty() const { return n == 0; }
+    const T& operator[](int i) const { return v[i]; }
+    T& operator[](int i) { return v[i]; }
+    const T& back() const { return v[n - 1]; }
+    const T* begin() const { return v; }
+    const T* end() const { return v + n; }
+    T* begin() { return v; }
+    T* end() { return v + n; }
+    friend bool operator==(const SmallVec& a, const SmallVec& b) {
+        if (a.n != b.n) return false;
+        for (int i = 0; i < a.n; ++i)
+            if (!(a.v[i] == b.v[i])) return false;
+        return true;
+    }
+};
+
 // -------- Capture-path table (pure geometry, no board state) --------
 
 struct PathStep {
@@ -75,44 +101,66 @@ struct PathStep {
     bool did_bounce;  // always false (kept for shape parity with Rust/Python)
 };
 
-inline const std::map<std::tuple<int, int, int, int>, std::vector<PathStep>>& capture_paths() {
+// Flat direct-indexed table (was a std::map<tuple> — a log-n tuple-compare
+// lookup on every find_capture_hops call). Index = ((f0+1)*10 + r0+1)*4 +
+// (df>0)*2 + (dr>0); a straight diagonal on the 10x10 grid is at most 9 steps,
+// MAX_HOP_STEPS kept as the array bound for shape parity with the references.
+struct PathList {
+    PathStep s[MAX_HOP_STEPS];
+    int n = 0;
+    int size() const { return n; }
+    const PathStep& operator[](int i) const { return s[i]; }
+};
+
+inline const PathList& capture_path(int f0, int r0, int df0, int dr0) {
     static const auto table = [] {
-        std::map<std::tuple<int, int, int, int>, std::vector<PathStep>> paths;
-        for (int f0 = -1; f0 <= 8; ++f0)
-            for (int r0 = -1; r0 <= 8; ++r0)
-                for (int df0 : {-1, 1})
-                    for (int dr0 : {-1, 1}) {
-                        std::vector<PathStep> steps;
-                        steps.reserve(MAX_HOP_STEPS);
-                        int f = f0, r = r0;
+        std::array<PathList, 10 * 10 * 4> paths{};
+        for (int f0i = -1; f0i <= 8; ++f0i)
+            for (int r0i = -1; r0i <= 8; ++r0i)
+                for (int dfi : {-1, 1})
+                    for (int dri : {-1, 1}) {
+                        PathList& steps =
+                            paths[((f0i + 1) * 10 + (r0i + 1)) * 4 + (dfi > 0) * 2 + (dri > 0)];
+                        int f = f0i, r = r0i;
                         for (int i = 0; i < MAX_HOP_STEPS; ++i) {
-                            const int nf = f + df0, nr = r + dr0;
+                            const int nf = f + dfi, nr = r + dri;
                             if (nf < -1 || nf > 8 || nr < -1 || nr > 8) break;
                             f = nf;
                             r = nr;
                             const int sq = on_board(f, r) ? sq_idx(f, r) : -1;
-                            steps.push_back(PathStep{f, r, sq, coord10_of(f, r), df0, dr0, false});
+                            steps.s[steps.n++] =
+                                PathStep{f, r, sq, coord10_of(f, r), dfi, dri, false};
                         }
-                        paths[{f0, r0, df0, dr0}] = std::move(steps);
                     }
         return paths;
     }();
-    return table;
+    return table[((f0 + 1) * 10 + (r0 + 1)) * 4 + (df0 > 0) * 2 + (dr0 > 0)];
 }
 
 // -------- CaptureHop + find_capture_hops --------
+
+// A single hop captures at most the Whites on one straight diagonal (<= 8 board
+// squares) and traces <= 9 grid steps, so both lists fit inline (POD hop ->
+// emit/copy/dedup never allocate; capacity 12 leaves slack over the geometry).
+using HopCaptures = SmallVec<int, 12>;
+using HopWaypoints = SmallVec<uint8_t, 12>;
 
 struct CaptureHop {
     int df, dr;                          // direction
     uint8_t landing_c10;                 // coord10 of the landing key
     int landing_square;                  // -1 == None (rim / overshoot)
-    std::vector<int> captures;           // board squares of Whites captured on the path
-    std::vector<uint8_t> waypoints;      // every traced step's coord10 (incl. landing)
+    HopCaptures captures;                // board squares of Whites captured on the path
+    HopWaypoints waypoints;              // every traced step's coord10 (incl. landing)
     bool is_suicide;
     bool crossed_rank1;
     int cadence;                         // landing distance k
     bool is_overshoot;
 };
+
+// <= 1 emit per traced step (<= 9) + the off-grid overshoot.
+using HopList = SmallVec<CaptureHop, 12>;
+// Union over <= 4 directions.
+using HopOptions = SmallVec<CaptureHop, 48>;
 
 // Walk (df0, dr0) up to n+1 steps from (f0, r0). Emits a CaptureHop for every
 // legal landing. Ports the Python/Rust logic exactly, including:
@@ -122,20 +170,18 @@ struct CaptureHop {
 //    -> no overshoot past it);
 //  - the off-grid overshoot is a candidate DISTINCT from a rim landing at the
 //    same key (different cadence), so both are kept.
-inline std::vector<CaptureHop> find_capture_hops(
+inline HopList find_capture_hops(
     uint64_t occupied, uint64_t occupied_white,
     const StackMap& stacks,
     int f0, int r0, int df0, int dr0, int n) {
-    std::vector<CaptureHop> options;
-    std::vector<int> captures_so_far;
+    HopList options;
+    HopCaptures captures_so_far;
     uint64_t captured_set = 0;
-    std::vector<uint8_t> waypoints_so_far;
+    HopWaypoints waypoints_so_far;
     bool crossed_rank1 = false;
     bool friendly_blocked = false;
 
-    const auto it = capture_paths().find({f0, r0, df0, dr0});
-    if (it == capture_paths().end()) return options;
-    const std::vector<PathStep>& path = it->second;
+    const PathList& path = capture_path(f0, r0, df0, dr0);
     const int max_step = n + 1;
 
     for (int step_idx = 0; step_idx < (int)path.size(); ++step_idx) {
@@ -198,9 +244,19 @@ inline std::vector<CaptureHop> find_capture_hops(
 // black_diagonal_capture_moves_native) and the pure-Python reference in
 // moves_black.py. Builds the full capture MoveDicts on top of the hop atom.
 
-inline std::vector<std::pair<int, int>> dirs_for_top(char top) {
-    if (top == 'k') return {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-    return {{-1, -1}, {1, -1}};
+// Lightweight span over static direction tables (was a fresh std::vector per
+// call — one heap alloc in every movegen loop). Forward diagonals are the
+// first two entries, so both cases share one array.
+struct DirSpan {
+    const std::pair<int, int>* p;
+    int n;
+    const std::pair<int, int>* begin() const { return p; }
+    const std::pair<int, int>* end() const { return p + n; }
+};
+
+inline DirSpan dirs_for_top(char top) {
+    static constexpr std::pair<int, int> kDiags[4] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+    return {kDiags, top == 'k' ? 4 : 2};
 }
 
 inline bool hop_promotes(const CaptureHop& hop) {
@@ -232,38 +288,48 @@ struct ChainMove {
 
 // dedup + cadence-lock + last-dir(no-reversal) + suicide filter over the hop
 // atom, across the directions valid for the current tower top.
-inline std::vector<CaptureHop> next_capture_options(
+// identity = (df, dr, landing_c10, captures, is_suicide, is_overshoot, cadence)
+inline bool same_hop_key(const CaptureHop& a, const CaptureHop& b) {
+    return a.df == b.df && a.dr == b.dr && a.landing_c10 == b.landing_c10 &&
+           a.is_suicide == b.is_suicide && a.is_overshoot == b.is_overshoot &&
+           a.cadence == b.cadence && a.captures == b.captures;
+}
+
+inline HopOptions next_capture_options(
     uint64_t occupied, uint64_t occupied_white, const StackMap& stacks,
     int cf, int cr, const Tower& cur_stack, bool has_last_dir, int ldf, int ldr, int n,
     bool has_cadence, int cadence, bool include_suicide) {
-    std::vector<CaptureHop> options;
+    HopOptions options;
     if (cur_stack.empty()) return options;
     for (auto [df, dr] : dirs_for_top(cur_stack.back())) {
         if (has_last_dir && df == -ldf && dr == -ldr) continue;
-        for (auto& hop : find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n))
+        for (const auto& hop :
+             find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n))
             options.push_back(hop);
     }
-    if (!include_suicide) {
-        std::vector<CaptureHop> t;
-        for (auto& h : options)
-            if (!h.is_suicide) t.push_back(h);
-        options = std::move(t);
+    // In-place stable filters (order preserved exactly as before).
+    int w = 0;
+    for (int i = 0; i < options.size(); ++i) {
+        const CaptureHop& h = options[i];
+        if (!include_suicide && h.is_suicide) continue;
+        if (has_cadence && h.cadence != cadence) continue;
+        if (w != i) options[w] = h;
+        ++w;
     }
-    if (has_cadence) {
-        std::vector<CaptureHop> t;
-        for (auto& h : options)
-            if (h.cadence == cadence) t.push_back(h);
-        options = std::move(t);
+    options.n = w;
+    // First-occurrence dedup; N is tiny (<= 48) so the quadratic scan is cheaper
+    // than the old set-of-tuples (which heap-allocated a node + a captures
+    // vector copy per insert).
+    w = 0;
+    for (int i = 0; i < options.size(); ++i) {
+        bool dup = false;
+        for (int j = 0; j < w && !dup; ++j) dup = same_hop_key(options[j], options[i]);
+        if (dup) continue;
+        if (w != i) options[w] = options[i];
+        ++w;
     }
-    // identity = (df, dr, landing_c10, captures, is_suicide, is_overshoot, cadence)
-    std::set<std::tuple<int, int, uint8_t, std::vector<int>, bool, bool, int>> seen;
-    std::vector<CaptureHop> deduped;
-    for (auto& h : options) {
-        auto key = std::make_tuple(h.df, h.dr, h.landing_c10, h.captures, h.is_suicide,
-                                   h.is_overshoot, h.cadence);
-        if (seen.insert(key).second) deduped.push_back(h);
-    }
-    return deduped;
+    options.n = w;
+    return options;
 }
 
 inline ChainMove build_final_move(int chain_start, const Tower& orig_stack,
@@ -376,7 +442,7 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
                                        const StackMap& stacks, int chain_start,
                                        int cf, int cr, const Tower& cur_stack,
                                        bool has_last_dir, int ldf, int ldr,
-                                       std::vector<CaptureHop> hops_so_far, bool has_cadence,
+                                       std::vector<CaptureHop>& hops_so_far, bool has_cadence,
                                        int cadence, int n, const Tower& orig_stack,
                                        std::vector<ChainMove>& results) {
     // White-king-captured short-circuit (game over -> stop extending the chain).
@@ -384,24 +450,27 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
     auto options = next_capture_options(occupied, occupied_white, stacks, cf, cr, cur_stack,
                                         has_last_dir, ldf, ldr, n, has_cadence, cadence, false);
     if (options.empty()) return;
-    for (auto& hop : options) {
-        std::vector<CaptureHop> hops_next = hops_so_far;
-        hops_next.push_back(hop);
-        results.push_back(build_final_move(chain_start, orig_stack, hops_next));
-        if (hop.is_overshoot) continue;
-        auto ap = apply_hop(occupied, occupied_white, stacks, cf, cr, cur_stack, hop);
-        int nf, nr;
-        if (hop.landing_square >= 0) {
-            nf = hop.landing_square & 7;
-            nr = hop.landing_square >> 3;
-        } else {
-            nf = c10_file(hop.landing_c10);
-            nr = c10_rank(hop.landing_c10);
+    // Backtracking accumulator (was a full vector copy per recursion level):
+    // push the hop, emit/recurse, pop. Enumeration order is unchanged.
+    for (const auto& hop : options) {
+        hops_so_far.push_back(hop);
+        results.push_back(build_final_move(chain_start, orig_stack, hops_so_far));
+        if (!hop.is_overshoot) {
+            auto ap = apply_hop(occupied, occupied_white, stacks, cf, cr, cur_stack, hop);
+            int nf, nr;
+            if (hop.landing_square >= 0) {
+                nf = hop.landing_square & 7;
+                nr = hop.landing_square >> 3;
+            } else {
+                nf = c10_file(hop.landing_c10);
+                nr = c10_rank(hop.landing_c10);
+            }
+            const int next_cadence = has_cadence ? cadence : hop.cadence;
+            enumerate_chains_recursive(ap.occupied, ap.occupied_white, king_sq, ap.stacks,
+                                       chain_start, nf, nr, ap.land_stack, true, hop.df, hop.dr,
+                                       hops_so_far, true, next_cadence, n, orig_stack, results);
         }
-        const int next_cadence = has_cadence ? cadence : hop.cadence;
-        enumerate_chains_recursive(ap.occupied, ap.occupied_white, king_sq, ap.stacks, chain_start,
-                                   nf, nr, ap.land_stack, true, hop.df, hop.dr, hops_next, true,
-                                   next_cadence, n, orig_stack, results);
+        hops_so_far.pop_back();
     }
 }
 
@@ -414,9 +483,11 @@ inline std::vector<ChainMove> enumerate_chains(uint64_t occupied, uint64_t occup
     const Tower orig_stack = it->second;
     const int n = (int)orig_stack.size();
     std::vector<ChainMove> results;
+    std::vector<CaptureHop> hops;
+    hops.reserve(16);
     enumerate_chains_recursive(occupied, occupied_white, king_sq, stacks, chain_start,
-                               chain_start & 7, chain_start >> 3, orig_stack, false, 0, 0, {}, false,
-                               0, n, orig_stack, results);
+                               chain_start & 7, chain_start >> 3, orig_stack, false, 0, 0, hops,
+                               false, 0, n, orig_stack, results);
     return results;
 }
 
@@ -429,9 +500,14 @@ inline std::vector<ChainMove> first_hop_suicides(uint64_t occupied, uint64_t occ
     const int n = (int)pieces.size();
     const int cf = chain_start & 7, cr = chain_start >> 3;
     std::vector<ChainMove> moves;
+    std::vector<CaptureHop> one(1);
     for (auto [df, dr] : dirs_for_top(pieces.back()))
-        for (auto& hop : find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n))
-            if (hop.is_suicide) moves.push_back(build_final_move(chain_start, pieces, {hop}));
+        for (const auto& hop :
+             find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n))
+            if (hop.is_suicide) {
+                one[0] = hop;
+                moves.push_back(build_final_move(chain_start, pieces, one));
+            }
     return moves;
 }
 
@@ -748,15 +824,16 @@ inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t oc
     const bool mandate = black_mandatory_capture_active(occupied, occupied_white, stacks);
 
     std::vector<AnyMove> out;
+    out.reserve(quiet.size() + deploy.size() + charge.size() + chain.size());
     if (mandate) {
         for (auto& c : charge)
-            if (c.capture_sq >= 0) out.push_back(c);
-        for (auto& cm : chain) out.push_back(cm);
+            if (c.capture_sq >= 0) out.push_back(std::move(c));
+        for (auto& cm : chain) out.push_back(std::move(cm));
     } else {
-        for (auto& q : quiet) out.push_back(q);
-        for (auto& dm : deploy) out.push_back(dm);
-        for (auto& c : charge) out.push_back(c);
-        for (auto& cm : chain) out.push_back(cm);
+        for (auto& q : quiet) out.push_back(std::move(q));
+        for (auto& dm : deploy) out.push_back(std::move(dm));
+        for (auto& c : charge) out.push_back(std::move(c));
+        for (auto& cm : chain) out.push_back(std::move(cm));
     }
     return out;
 }
@@ -769,7 +846,7 @@ inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t oc
 // (square_attacked_by_black_chessckers). python-chess's own is_check is wrong
 // here because it treats the Black-King encoding as a FIDE 8-direction king.
 
-inline bool contains(const std::vector<int>& v, int x) {
+inline bool contains(const HopCaptures& v, int x) {
     return std::find(v.begin(), v.end(), x) != v.end();
 }
 
