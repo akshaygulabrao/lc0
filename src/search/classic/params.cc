@@ -287,6 +287,23 @@ const OptionId BaseSearchParams::kNoiseAlphaId{
                   "probabilities. Larger values result in flatter / more "
                   "evenly distributed values.",
      .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGumbelShId{
+    {.long_flag = "gumbel-sh",
+     .uci_option = "GumbelSequentialHalving",
+     .help_text =
+         "Root search uses Gumbel top-m action sampling with Sequential "
+         "Halving visit allocation (Danihelka et al. 2022) instead of "
+         "PUCT+Dirichlet+temperature; the played move is the final Sequential "
+         "Halving winner. Non-root selection stays PUCT. Intended for "
+         "low-visit self-play training.",
+     .visibility = OptionId::kProOnly}};
+const OptionId BaseSearchParams::kGumbelMId{
+    {.long_flag = "gumbel-m",
+     .uci_option = "GumbelMaxConsideredMoves",
+     .help_text = "Maximum number of root moves sampled without replacement "
+                  "(Gumbel top-m) for Sequential Halving when --gumbel-sh is "
+                  "on.",
+     .visibility = OptionId::kProOnly}};
 const OptionId BaseSearchParams::kVerboseStatsId{
     "verbose-move-stats", "VerboseMoveStats",
     "Display Q, V, N, U and P values of every move candidate after each move.",
@@ -562,6 +579,8 @@ void BaseSearchParams::Populate(OptionsParser* options) {
       0.0f;
   options->Add<FloatOption>(kNoiseEpsilonId, 0.0f, 1.0f) = 0.0f;
   options->Add<FloatOption>(kNoiseAlphaId, 0.0f, 10000000.0f) = 0.3f;
+  options->Add<BoolOption>(kGumbelShId) = false;
+  options->Add<IntOption>(kGumbelMId, 2, 256) = 16;
   options->Add<BoolOption>(kVerboseStatsId) = false;
   options->Add<BoolOption>(kLogLiveStatsId) = false;
   std::vector<std::string> fpu_strategy = {"reduction", "absolute"};
@@ -656,6 +675,8 @@ BaseSearchParams::BaseSearchParams(const OptionsDict& options)
       kTwoFoldDraws(options.Get<bool>(kTwoFoldDrawsId)),
       kNoiseEpsilon(options.Get<float>(kNoiseEpsilonId)),
       kNoiseAlpha(options.Get<float>(kNoiseAlphaId)),
+      kGumbelSh(options.Get<bool>(kGumbelShId)),
+      kGumbelM(options.Get<int>(kGumbelMId)),
       kFpuAbsolute(options.Get<std::string>(kFpuStrategyId) == "absolute"),
       kFpuValue(options.Get<float>(kFpuValueId)),
       kFpuAbsoluteAtRoot(

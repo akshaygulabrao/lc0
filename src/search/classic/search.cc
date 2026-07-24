@@ -701,12 +701,228 @@ void Search::ResetBestMove() {
   bestmove_is_sent_ = old_sent;
 }
 
+namespace {
+// Gumbel S2 root ranking: g + logit + sigma(q) per Danihelka et al. 2022,
+// with sigma = (c_visit + max_n) * c_scale over min-max normalized q — the
+// same q convention as the S1 improved-policy target in selfplay/game.cc
+// (c_visit=50, c_scale=0.1 there too). Non-alive entries score -inf.
+std::vector<float> GumbelRootScores(const std::vector<float>& g_plus_logit,
+                                    const std::vector<float>& q,
+                                    const std::vector<bool>& alive,
+                                    uint32_t max_n) {
+  const float kInf = std::numeric_limits<float>::infinity();
+  float lo = kInf, hi = -kInf;
+  for (size_t i = 0; i < q.size(); ++i) {
+    if (!alive[i]) continue;
+    lo = std::min(lo, q[i]);
+    hi = std::max(hi, q[i]);
+  }
+  const float rng = hi - lo;
+  const float sig = (50.0f + static_cast<float>(max_n)) * 0.1f;
+  std::vector<float> scores(q.size(), -kInf);
+  for (size_t i = 0; i < q.size(); ++i) {
+    if (!alive[i]) continue;
+    const float qn = (rng > 1e-8f) ? (q[i] - lo) / rng : 0.5f;
+    scores[i] = g_plus_logit[i] + sig * qn;
+  }
+  return scores;
+}
+}  // namespace
+
+void Search::SetGumbelVisitBudget(int64_t visits) {
+  gumbel_budget_ = visits;
+  gumbel_active_ =
+      params_.GetGumbelSh() && visits > 0 && root_move_filter_.empty();
+}
+
+void Search::GumbelMaybeInit() {
+  Mutex::Lock lock(gumbel_mutex_);
+  if (gumbel_init_done_) return;
+  const int num_edges = root_node_->GetNumEdges();
+  if (num_edges == 0) return;
+  // Remaining budget this move: the VisitsStopper bound counts reused-tree
+  // visits, so with tree reuse a move can arrive with little (or nothing)
+  // left. SH then degenerates to ranking the sampled candidates as-is.
+  const int64_t budget = std::max<int64_t>(0, gumbel_budget_ - initial_visits_);
+  int m = std::min(params_.GetGumbelM(), num_edges);
+  if (budget < m) m = std::max(1, static_cast<int>(budget));
+  // Sample g(a) once per root edge; keep the top m by g + log P.
+  std::vector<GumbelCandidate> all;
+  all.reserve(num_edges);
+  int idx = 0;
+  for (auto& edge : root_node_->Edges()) {
+    float u = Random::Get().GetFloat(1.0f);
+    u = std::min(std::max(u, 1e-7f), 1.0f - 1e-7f);
+    const float g = -std::log(-std::log(u));
+    const float logit = std::log(std::max(edge.GetP(), 1e-9f));
+    all.push_back({idx, g, logit, edge.GetN(), true});
+    ++idx;
+  }
+  std::partial_sort(all.begin(), all.begin() + m, all.end(),
+                    [](const GumbelCandidate& a, const GumbelCandidate& b) {
+                      return a.gumbel + a.logit > b.gumbel + b.logit;
+                    });
+  all.resize(m);
+  gumbel_cands_ = std::move(all);
+  // Sequential Halving: phase p has alive_p candidates, each getting
+  // budget/(phases*alive_p) additional visits (>=1). Targets are cumulative
+  // added visits per candidate. m=16, budget=64 -> 1,2,4,8 over 16,8,4,2.
+  const int phases =
+      std::max(1, static_cast<int>(std::ceil(std::log2(std::max(2, m)))));
+  gumbel_phase_targets_.clear();
+  int cum = 0;
+  int alive = m;
+  for (int p = 0; p < phases; ++p) {
+    cum += std::max<int64_t>(
+        1, budget / (static_cast<int64_t>(phases) * std::max(1, alive)));
+    gumbel_phase_targets_.push_back(cum);
+    alive = std::max(1, (alive + 1) / 2);
+  }
+  gumbel_phase_ = 0;
+  gumbel_init_done_ = true;
+}
+
+int Search::GumbelPickRootChild() {
+  Mutex::Lock lock(gumbel_mutex_);
+  if (!gumbel_init_done_) return kGumbelWait;
+  const int ncand = static_cast<int>(gumbel_cands_.size());
+  // Snapshot candidate stats (atomics; NStarted includes in-flight visits).
+  std::vector<uint32_t> n(ncand, 0), nstarted(ncand, 0);
+  std::vector<float> q(ncand, 0.0f);
+  const float qsign = root_same_mover_children_ ? -1.0f : 1.0f;
+  {
+    int idx = 0, filled = 0;
+    for (auto& edge : root_node_->Edges()) {
+      for (int c = 0; c < ncand; ++c) {
+        if (gumbel_cands_[c].edge_idx != idx) continue;
+        n[c] = edge.GetN();
+        nstarted[c] = edge.GetNStarted();
+        q[c] = qsign * edge.GetWL(0.0f);
+        ++filled;
+        break;
+      }
+      ++idx;
+      if (filled == ncand) break;
+    }
+  }
+  while (true) {
+    const int target = gumbel_phase_targets_[gumbel_phase_];
+    int best = -1;
+    int best_added = std::numeric_limits<int>::max();
+    bool in_flight = false;
+    for (int c = 0; c < ncand; ++c) {
+      const auto& cand = gumbel_cands_[c];
+      if (!cand.alive) continue;
+      const int added =
+          static_cast<int>(nstarted[c]) - static_cast<int>(cand.base_n);
+      if (n[c] < nstarted[c]) in_flight = true;
+      if (added < target && added < best_added) {
+        best_added = added;
+        best = c;
+      }
+    }
+    if (best >= 0) return gumbel_cands_[best].edge_idx;
+    // Phase quota is filled. Advance only once results have backed up —
+    // the ranking below needs settled Q values.
+    if (in_flight) return kGumbelWait;
+    if (gumbel_phase_ + 1 >=
+        static_cast<int>(gumbel_phase_targets_.size())) {
+      return kGumbelDone;
+    }
+    int alive_count = 0;
+    uint32_t max_n = 0;
+    std::vector<float> gl(ncand);
+    std::vector<bool> alive(ncand);
+    for (int c = 0; c < ncand; ++c) {
+      const auto& cand = gumbel_cands_[c];
+      gl[c] = cand.gumbel + cand.logit;
+      alive[c] = cand.alive;
+      if (cand.alive) {
+        ++alive_count;
+        max_n = std::max(max_n, n[c]);
+      }
+    }
+    const auto scores = GumbelRootScores(gl, q, alive, max_n);
+    const int keep = std::max(1, (alive_count + 1) / 2);
+    std::vector<int> order;
+    for (int c = 0; c < ncand; ++c) {
+      if (gumbel_cands_[c].alive) order.push_back(c);
+    }
+    std::sort(order.begin(), order.end(),
+              [&scores](int a, int b) { return scores[a] > scores[b]; });
+    for (size_t i = keep; i < order.size(); ++i) {
+      gumbel_cands_[order[i]].alive = false;
+    }
+    ++gumbel_phase_;
+  }
+}
+
+int Search::GumbelBestCandidate() const {
+  Mutex::Lock lock(gumbel_mutex_);
+  if (!gumbel_init_done_ || gumbel_cands_.empty()) return -1;
+  const int ncand = static_cast<int>(gumbel_cands_.size());
+  std::vector<float> gl(ncand), q(ncand, 0.0f);
+  std::vector<bool> alive(ncand);
+  uint32_t max_n = 0;
+  const float qsign = root_same_mover_children_ ? -1.0f : 1.0f;
+  {
+    int idx = 0, filled = 0;
+    for (auto& edge : root_node_->Edges()) {
+      for (int c = 0; c < ncand; ++c) {
+        if (gumbel_cands_[c].edge_idx != idx) continue;
+        q[c] = qsign * edge.GetWL(0.0f);
+        if (gumbel_cands_[c].alive) max_n = std::max(max_n, edge.GetN());
+        ++filled;
+        break;
+      }
+      ++idx;
+      if (filled == ncand) break;
+    }
+  }
+  for (int c = 0; c < ncand; ++c) {
+    gl[c] = gumbel_cands_[c].gumbel + gumbel_cands_[c].logit;
+    alive[c] = gumbel_cands_[c].alive;
+  }
+  const auto scores = GumbelRootScores(gl, q, alive, max_n);
+  int best = -1;
+  float best_score = -std::numeric_limits<float>::infinity();
+  for (int c = 0; c < ncand; ++c) {
+    if (alive[c] && scores[c] > best_score) {
+      best_score = scores[c];
+      best = c;
+    }
+  }
+  return best >= 0 ? gumbel_cands_[best].edge_idx : -1;
+}
+
 // Computes the best move, maybe with temperature (according to the settings).
 void Search::EnsureBestMoveKnown() REQUIRES(nodes_mutex_)
     REQUIRES(counters_mutex_) {
   if (bestmove_is_sent_) return;
   if (root_node_->GetN() == 0) return;
   if (!root_node_->HasChildren()) return;
+
+  // Gumbel S2: the played move is the Sequential Halving winner — no
+  // temperature, no visit-count sampling (root exploration comes from the
+  // Gumbel perturbation itself). Falls through to the standard path if the
+  // schedule never initialized (e.g. reused tree already at budget).
+  if (gumbel_active_) {
+    const int gumbel_idx = GumbelBestCandidate();
+    if (gumbel_idx >= 0) {
+      int idx = 0;
+      for (auto& edge : root_node_->Edges()) {
+        if (idx++ != gumbel_idx) continue;
+        EdgeAndNode best_edge = edge;
+        final_bestmove_ = best_edge.GetMove(played_history_.IsBlackToMove());
+        if (best_edge.GetN() > 0 && best_edge.node() != nullptr &&
+            best_edge.node()->HasChildren()) {
+          final_pondermove_ = GetBestChildNoTemperature(best_edge.node(), 1)
+                                  .GetMove(!played_history_.IsBlackToMove());
+        }
+        return;
+      }
+    }
+  }
 
   float temperature = params_.GetTemperature();
   const int cutoff_move = params_.GetTemperatureCutoffMove();
@@ -992,7 +1208,7 @@ void Search::PopulateCommonIterationStats(IterationStats* stats) {
     const auto m_evaluator = backend_attributes_.has_mlh
                                  ? MEvaluator(params_, root_node_)
                                  : MEvaluator();
-    for (const auto& edge : root_node_->Edges()) {
+    for (auto& edge : root_node_->Edges()) {
       const auto n = edge.GetN();
       const auto q = qsign * edge.GetQ(fpu, draw_score);
       const auto m = m_evaluator.GetMUtility(edge, q);
@@ -1719,8 +1935,15 @@ void SearchWorker::PickNodesToExtendTask(
       // Which we are putting off until after policy is copied so we can create
       // visited policy without having to cache it in the node (allowing the
       // node to stay at 64 bytes).
+      // Gumbel S2 (--gumbel-sh): once the root is expanded, build the
+      // Gumbel-top-m candidate set + Sequential Halving schedule (one-shot).
+      const bool gumbel_root = is_root_node && search_->gumbel_active_;
+      if (gumbel_root) search_->GumbelMaybeInit();
       int max_needed = node->GetNumEdges();
-      if (!is_root_node || root_move_filter.empty()) {
+      if (gumbel_root) {
+        // Gumbel candidates can sit at any edge index (sampled from the full
+        // prior), so keep the policy/util caches full-width.
+      } else if (!is_root_node || root_move_filter.empty()) {
         max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
       node->CopyPolicy(max_needed, current_pol.data());
@@ -1767,6 +1990,48 @@ void SearchWorker::PickNodesToExtendTask(
         float second_best = std::numeric_limits<float>::lowest();
         bool can_exit = false;
         best_edge.Reset();
+        int new_visits = 0;
+        if (gumbel_root) {
+          // Gumbel S2: the Sequential Halving schedule decides which root
+          // child gets the next visit — PUCT and root smart pruning are
+          // bypassed. WAIT means the current phase's quota is filled but its
+          // results are still in flight: convert the remaining limit into a
+          // collision so the batch evaluates and backs them up. The root's
+          // in-flight was pre-incremented at entry and root-level collisions
+          // are not walked by CancelSharedCollisions, so undo it here.
+          int pick = search_->GumbelPickRootChild();
+          if (pick == Search::kGumbelWait) {
+            node->CancelScoreUpdate(cur_limit);
+            receiver->push_back(NodeToProcess::Collision(
+                node, static_cast<uint16_t>(current_path.size() + base_depth),
+                cur_limit, 0));
+            completed_visits += cur_limit;
+            cur_limit = 0;
+            break;
+          }
+          if (pick == Search::kGumbelDone) {
+            // Schedule exhausted (stopper about to fire): park the remainder
+            // on the current leader.
+            pick = search_->GumbelBestCandidate();
+            if (pick < 0) pick = 0;
+            new_visits = cur_limit;
+          } else {
+            new_visits = 1;
+          }
+          while (cache_filled_idx < pick) {
+            const int idx = ++cache_filled_idx;
+            if (idx == 0) {
+              cur_iters[idx] = node->Edges();
+            } else {
+              cur_iters[idx] = cur_iters[idx - 1];
+              ++cur_iters[idx];
+            }
+            current_nstarted[idx] = cur_iters[idx].GetNStarted();
+            current_score[idx] = std::numeric_limits<float>::lowest();
+          }
+          best_idx = pick;
+          best_edge = cur_iters[best_idx];
+        } else {
         for (int idx = 0; idx < max_needed; ++idx) {
           if (idx > cache_filled_idx) {
             if (idx == 0) {
@@ -1823,7 +2088,6 @@ void SearchWorker::PickNodesToExtendTask(
             can_exit = true;
           }
         }
-        int new_visits = 0;
         if (second_best_edge) {
           int estimated_visits_to_change_best = std::numeric_limits<int>::max();
           if (best_without_u < second_best) {
@@ -1841,6 +2105,7 @@ void SearchWorker::PickNodesToExtendTask(
           // No second best - only one edge, so everything goes in here.
           new_visits = cur_limit;
         }
+        }  // end of non-gumbel (PUCT) selection.
         if (best_idx >= vtp_last_filled.back()) {
           auto* vtp_array = visits_to_perform.back().get()->data();
           std::fill(vtp_array + (vtp_last_filled.back() + 1),
@@ -2224,8 +2489,10 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
   for (size_t p_idx = 0; auto& edge : node->Edges()) {
     edge.edge()->SetP(node_to_process->eval->p[p_idx++]);
   }
-  // Add Dirichlet noise if enabled and at root.
-  if (params_.GetNoiseEpsilon() && node == search_->root_node_) {
+  // Add Dirichlet noise if enabled and at root. Gumbel S2 replaces noise
+  // with the Gumbel root perturbation — never mix the two.
+  if (params_.GetNoiseEpsilon() && !params_.GetGumbelSh() &&
+      node == search_->root_node_) {
     ApplyDirichletNoise(node, params_.GetNoiseEpsilon(),
                         params_.GetNoiseAlpha());
   }

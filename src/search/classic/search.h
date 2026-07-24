@@ -94,6 +94,12 @@ class Search {
   // from temperature having been applied again.
   void ResetBestMove();
 
+  // Gumbel S2 (--gumbel-sh): hands the search its total visit budget (the
+  // VisitsStopper bound) so the root Sequential Halving schedule can be
+  // computed over budget - initial_visits_. No-op unless --gumbel-sh is on.
+  // Must be called before StartThreads/RunBlocking.
+  void SetGumbelVisitBudget(int64_t visits);
+
  private:
   // Computes the best move, maybe with temperature (according to the settings).
   void EnsureBestMoveKnown();
@@ -208,6 +214,36 @@ class Search {
 
   std::unique_ptr<UciResponder> uci_responder_;
   ContemptMode contempt_mode_;
+
+  // Gumbel S2 (--gumbel-sh) root state: Gumbel-top-m candidate set +
+  // Sequential Halving schedule over the remaining visit budget. All mutable
+  // state is guarded by gumbel_mutex_ (the gather loop may hold nodes_mutex_
+  // only shared); edge N/NStarted reads are atomics.
+  struct GumbelCandidate {
+    int edge_idx;     // index into the root's prior-sorted edge order
+    float gumbel;     // g(a), sampled once at init
+    float logit;      // log P(a) at init
+    uint32_t base_n;  // child N at init (tree-reuse offset)
+    bool alive;       // still in the current Sequential Halving set
+  };
+  static constexpr int kGumbelWait = -1;  // phase visits still in flight
+  static constexpr int kGumbelDone = -2;  // schedule exhausted
+  // Builds the candidate set + schedule once the root is expanded.
+  void GumbelMaybeInit();
+  // Returns the edge_idx to visit next, kGumbelWait, or kGumbelDone.
+  int GumbelPickRootChild();
+  // Ranks alive candidates by g + logit + sigma(completedQ); returns the
+  // winner's edge index, or -1 if never initialized.
+  int GumbelBestCandidate() const;
+  bool gumbel_active_ = false;
+  int64_t gumbel_budget_ = 0;
+  mutable Mutex gumbel_mutex_;
+  bool gumbel_init_done_ GUARDED_BY(gumbel_mutex_) = false;
+  std::vector<GumbelCandidate> gumbel_cands_ GUARDED_BY(gumbel_mutex_);
+  int gumbel_phase_ GUARDED_BY(gumbel_mutex_) = 0;
+  // Cumulative added-visits target per alive candidate, one entry per phase.
+  std::vector<int> gumbel_phase_targets_ GUARDED_BY(gumbel_mutex_);
+
   friend class SearchWorker;
 };
 

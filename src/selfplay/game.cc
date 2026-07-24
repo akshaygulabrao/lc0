@@ -211,6 +211,10 @@ void SelfPlayGame::Play(int white_threads, int black_threads, bool training,
           /* searchmoves */ MoveList(), std::chrono::steady_clock::now(),
           std::move(stoppers), /* infinite */ false, /* ponder */ false,
           search_options, syzygy_tb);
+      // Gumbel S2 (--gumbel-sh): the root Sequential Halving schedule needs
+      // the total visit budget; limits.visits is the VisitsStopper bound
+      // installed above. No-op unless the flag is on.
+      search_->SetGumbelVisitBudget(limits.visits);
     }
 
     // Do search.
