@@ -123,25 +123,37 @@ NodeGarbageCollector gNodeGc;
 // Edge
 /////////////////////////////////////////////////////////////////////////
 
+namespace {
+// Thread-local direct-mapped memo: search descents and per-node loops call
+// GetEdgeMove for a handful of nearby positions over and over; regenerating
+// once per (thread, position) makes materialization ~a hash lookup. Keyed on
+// board CONTENT (not node pointers), so node reuse/GC can never serve stale
+// moves — equal boards generate equal move lists by construction. The board
+// hash comes precomputed from the Node (cached at CreateEdges) so a hit costs
+// one slot probe + a memberwise board compare, no hashing.
+struct MoveMemoEntry {
+  uint64_t hash = 0;
+  bool valid = false;
+  ChessBoard board;
+  MoveList moves;
+};
+// Sized for the descent working set: a gather pass walks root→leaf paths of
+// depth ~10-25 and revisits the same nodes across the visits of one search,
+// so the memo must hold the whole path region without collisions (32 slots
+// measurably thrashed: 2.4x node-throughput loss at the 128v match config).
+constexpr size_t kMoveMemoSlots = 512;
+thread_local std::array<MoveMemoEntry, kMoveMemoSlots> g_move_memo;
+
+MoveMemoEntry& MoveMemoSlot(uint64_t hash) {
+  return g_move_memo[hash % kMoveMemoSlots];
+}
+}  // namespace
+
 const MoveList& Node::MaterializedMoves() const {
   assert(board_);
-  // Thread-local direct-mapped memo: search descents and per-node loops call
-  // GetEdgeMove for a handful of nearby positions over and over; regenerating
-  // once per (thread, position) makes materialization ~a hash lookup. Keyed on
-  // board CONTENT (not node pointers), so node reuse/GC can never serve stale
-  // moves — equal boards generate equal move lists by construction.
-  struct Entry {
-    uint64_t hash = 0;
-    bool valid = false;
-    ChessBoard board;
-    MoveList moves;
-  };
-  constexpr size_t kMemoSlots = 32;
-  static thread_local std::array<Entry, kMemoSlots> memo;
-  const uint64_t h = board_->Hash();
-  Entry& e = memo[h % kMemoSlots];
-  if (!e.valid || e.hash != h || !(e.board == *board_)) {
-    e.hash = h;
+  MoveMemoEntry& e = MoveMemoSlot(board_hash_);
+  if (!e.valid || e.hash != board_hash_ || !(e.board == *board_)) {
+    e.hash = board_hash_;
     e.board = *board_;
     e.moves = board_->GenerateLegalMoves();
     e.valid = true;
@@ -233,7 +245,7 @@ Node* Node::CreateSingleChildNode(const ChessBoard& board, Move move) {
   assert(!child_);
   // Resolve the played move's index in the canonical generated list; the
   // single edge must materialize back to exactly this move.
-  const MoveList legal = board.GenerateLegalMoves();
+  MoveList legal = board.GenerateLegalMoves();
   int idx = -1;
   for (size_t i = 0; i < legal.size(); ++i) {
     if (legal[i] == move) {
@@ -246,6 +258,13 @@ Node* Node::CreateSingleChildNode(const ChessBoard& board, Move move) {
                     " not found in generated legal moves");
   }
   board_ = std::make_unique<ChessBoard>(board);
+  board_hash_ = board.Hash();
+  // Seed this thread's memo with the list we just generated.
+  MoveMemoEntry& e = MoveMemoSlot(board_hash_);
+  e.hash = board_hash_;
+  e.board = board;
+  e.moves = std::move(legal);
+  e.valid = true;
   edges_ = Edge::MakeEdges(1);
   edges_[0].gen_idx_ = static_cast<uint16_t>(idx);
   num_edges_ = 1;
@@ -257,6 +276,16 @@ void Node::CreateEdges(const ChessBoard& board, const MoveList& moves) {
   assert(!edges_);
   assert(!child_);
   board_ = std::make_unique<ChessBoard>(board);
+  board_hash_ = board.Hash();
+  // Seed this thread's memo with the caller's already-generated list, so the
+  // NN-input build and root loops that materialize these edges right after
+  // expansion don't regenerate it (movegen would otherwise run twice per
+  // expansion — a measured ~20% node-throughput loss).
+  MoveMemoEntry& e = MoveMemoSlot(board_hash_);
+  e.hash = board_hash_;
+  e.board = board;
+  e.moves = moves;
+  e.valid = true;
   if (moves.size() > static_cast<size_t>(kMaxNumEdges)) {
     // Search scratch buffers are sized by kMaxNumEdges; a wider position must
     // degrade (search a subset) rather than overflow them. Loud so any real

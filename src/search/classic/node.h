@@ -316,6 +316,10 @@ class Node {
   // WL stands for "W minus L". Is equal to Q if draw score is 0.
   double wl_ = 0.0f;
 
+  // Hash of board_ (set with it in CreateEdges); lets move materialization
+  // probe the thread-local memo without rehashing the board on every call.
+  uint64_t board_hash_ = 0;
+
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
@@ -384,9 +388,9 @@ class Node {
 
 // A basic sanity check. This must be adjusted when Node members are adjusted.
 #if defined(__i386__) || (defined(__arm__) && !defined(__aarch64__))
-static_assert(sizeof(Node) == 52, "Unexpected size of Node for 32bit compile");
+static_assert(sizeof(Node) == 60, "Unexpected size of Node for 32bit compile");
 #else
-static_assert(sizeof(Node) == 72, "Unexpected size of Node");
+static_assert(sizeof(Node) == 80, "Unexpected size of Node");
 #endif
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
