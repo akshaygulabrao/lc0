@@ -444,7 +444,7 @@ std::vector<Move> SelfPlayGame::GetMoves() const {
   std::vector<Move> moves;
   for (classic::Node* node = tree_[0]->GetCurrentHead();
        node != tree_[0]->GetGameBeginNode(); node = node->GetParent()) {
-    moves.push_back(node->GetParent()->GetEdgeToNode(node)->GetMove());
+    moves.push_back(node->GetOwnMove());
   }
   std::vector<Move> result;
   Position pos = tree_[0]->GetPositionHistory().Starting();

@@ -89,14 +89,21 @@ inline constexpr int kMaxNumEdges = 1024;
 //                                       +------------+
 
 class Node;
+// An edge no longer OWNS its move. Storing a full Move per edge (a shared_ptr
+// to a heap cc::NativeMove with uci string + chain vectors, ~300B all-in) made
+// an expanded node cost ~num_edges×300B of RETAINED tree memory; late-game
+// Chessckers positions reach 500-1000+ legal moves (capture-chain fans), so an
+// in-flight 800-visit selfplay game accumulated gigabytes and the p32 fleet
+// OOM-looped at the cgroup ceiling (2026-07-24 run25/B2 balloon, root-caused
+// via heaptrack: 19.6G held from GenerateLegalMoves). Instead each edge keeps
+// only its INDEX in the canonical movegen order of the parent position; the
+// parent Node stores one POD ChessBoard copy and moves are re-materialized on
+// demand via Node::GetEdgeMove (gen_legal_native is deterministic, so this is
+// exact), with a thread-local memo absorbing the regen cost.
 class Edge {
  public:
-  // Creates array of edges from the list of moves.
-  static std::unique_ptr<Edge[]> FromMovelist(const MoveList& moves);
-
-  // Returns move from the point of view of the player making it (if as_opponent
-  // is false) or as opponent (if as_opponent is true).
-  Move GetMove(bool as_opponent = false) const;
+  // Creates an array of `count` edges with gen_idx_ = 0..count-1.
+  static std::unique_ptr<Edge[]> MakeEdges(size_t count);
 
   // Returns or sets value of Move policy prior returned from the neural net
   // (but can be changed by adding Dirichlet noise). Must be in [0,1].
@@ -107,10 +114,9 @@ class Edge {
   std::string DebugString() const;
 
  private:
-  // Move corresponding to this node. From the point of view of a player,
-  // i.e. black's e7e5 is stored as e2e4.
-  // Root node contains move a1a1.
-  Move move_;
+  // Index of this edge's move in the parent position's canonical generated
+  // move list (movegen order, BEFORE Node::SortEdges reorders the edge array).
+  uint16_t gen_idx_ = 0;
 
   // Probability that this move will be made, from the policy head of the neural
   // network; compressed to a 16 bit format (5 bits exp, 11 bits significand).
@@ -153,11 +159,22 @@ class Node {
   Node& operator=(Node&& move_from) = default;
 
   // Allocates a new edge and a new node. The node has to be no edges before
-  // that.
-  Node* CreateSingleChildNode(Move m);
+  // that. `board` is this node's position (needed to resolve the move's index
+  // in the canonical generated move list).
+  Node* CreateSingleChildNode(const ChessBoard& board, Move m);
 
   // Creates edges from a movelist. There has to be no edges before that.
-  void CreateEdges(const MoveList& moves);
+  // `board` is the position the moves were generated from; a copy is kept so
+  // edge moves can be re-materialized on demand (see Edge).
+  void CreateEdges(const ChessBoard& board, const MoveList& moves);
+
+  // Materializes the Move of one of this node's edges by regenerating the
+  // legal move list from the stored board (thread-local memo behind it).
+  // Mirrors the old Edge::GetMove(as_opponent) semantics.
+  Move GetEdgeMove(const Edge* edge, bool as_opponent = false) const;
+
+  // Materializes the move of the edge leading from the parent to this node.
+  Move GetOwnMove(bool as_opponent = false) const;
 
   // Gets parent node.
   Node* GetParent() const { return parent_; }
@@ -282,6 +299,11 @@ class Node {
   // For each child, ensures that its parent pointer is pointing to this.
   void UpdateChildrenParents();
 
+  // Regenerated legal moves of this node's position (thread-local memo; the
+  // reference is invalidated by the next call on a colliding memo slot, so
+  // callers must copy out what they need before calling again).
+  const MoveList& MaterializedMoves() const;
+
   // To minimize the number of padding bytes and to avoid having unnecessary
   // padding when new fields are added, we arrange the fields by size, largest
   // to smallest.
@@ -297,6 +319,10 @@ class Node {
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
+  // The position at this node (set together with edges_); source of truth for
+  // re-materializing edge moves. POD copy, one small allocation per expanded
+  // node — replaces per-edge retained NativeMoves (see Edge).
+  std::unique_ptr<ChessBoard> board_;
   // Pointer to a parent node. nullptr for the root.
   Node* parent_ = nullptr;
   // Pointer to a first child. nullptr for a leaf node.
@@ -358,9 +384,9 @@ class Node {
 
 // A basic sanity check. This must be adjusted when Node members are adjusted.
 #if defined(__i386__) || (defined(__arm__) && !defined(__aarch64__))
-static_assert(sizeof(Node) == 48, "Unexpected size of Node for 32bit compile");
+static_assert(sizeof(Node) == 52, "Unexpected size of Node for 32bit compile");
 #else
-static_assert(sizeof(Node) == 64, "Unexpected size of Node");
+static_assert(sizeof(Node) == 72, "Unexpected size of Node");
 #endif
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
@@ -368,7 +394,10 @@ static_assert(sizeof(Node) == 64, "Unexpected size of Node");
 class EdgeAndNode {
  public:
   EdgeAndNode() = default;
-  EdgeAndNode(Edge* edge, Node* node) : edge_(edge), node_(node) {}
+  // `parent` is the node OWNING the edge (needed to materialize the edge's
+  // move); `node` is the CHILD node the edge points to (may be nullptr).
+  EdgeAndNode(Edge* edge, Node* node, Node* parent)
+      : edge_(edge), node_(node), parent_(parent) {}
   void Reset() { edge_ = nullptr; }
   explicit operator bool() const { return edge_ != nullptr; }
   bool operator==(const EdgeAndNode& other) const {
@@ -410,7 +439,7 @@ class EdgeAndNode {
   // Edge related getters.
   float GetP() const { return edge_->GetP(); }
   Move GetMove(bool flip = false) const {
-    return edge_ ? edge_->GetMove(flip) : Move();
+    return edge_ ? parent_->GetEdgeMove(edge_, flip) : Move();
   }
 
   // Returns U = numerator * p / N.
@@ -427,6 +456,8 @@ class EdgeAndNode {
   Edge* edge_ = nullptr;
   // nullptr means that the edge doesn't yet have node extended.
   Node* node_ = nullptr;
+  // The node owning edge_ (non-null whenever edge_ is non-null).
+  Node* parent_ = nullptr;
 };
 
 // TODO(crem) Replace this with less hacky iterator once we support C++17.
@@ -461,7 +492,8 @@ class Edge_Iterator : public EdgeAndNode {
   // Creates "begin()" iterator. Also happens to be a range constructor.
   // child_ptr will be nullptr if parent_node is solid children.
   Edge_Iterator(const Node& parent_node, Ptr child_ptr)
-      : EdgeAndNode(parent_node.edges_.get(), nullptr),
+      : EdgeAndNode(parent_node.edges_.get(), nullptr,
+                    const_cast<Node*>(&parent_node)),
         node_ptr_(child_ptr),
         total_count_(parent_node.num_edges_) {
     if (edge_ && child_ptr != nullptr) Actualize();

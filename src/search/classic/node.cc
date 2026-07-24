@@ -28,6 +28,7 @@
 #include "search/classic/node.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -122,11 +123,44 @@ NodeGarbageCollector gNodeGc;
 // Edge
 /////////////////////////////////////////////////////////////////////////
 
-Move Edge::GetMove(bool as_opponent) const {
-  if (!as_opponent) return move_;
-  Move m = move_;
-  m.Flip();
+const MoveList& Node::MaterializedMoves() const {
+  assert(board_);
+  // Thread-local direct-mapped memo: search descents and per-node loops call
+  // GetEdgeMove for a handful of nearby positions over and over; regenerating
+  // once per (thread, position) makes materialization ~a hash lookup. Keyed on
+  // board CONTENT (not node pointers), so node reuse/GC can never serve stale
+  // moves — equal boards generate equal move lists by construction.
+  struct Entry {
+    uint64_t hash = 0;
+    bool valid = false;
+    ChessBoard board;
+    MoveList moves;
+  };
+  constexpr size_t kMemoSlots = 32;
+  static thread_local std::array<Entry, kMemoSlots> memo;
+  const uint64_t h = board_->Hash();
+  Entry& e = memo[h % kMemoSlots];
+  if (!e.valid || e.hash != h || !(e.board == *board_)) {
+    e.hash = h;
+    e.board = *board_;
+    e.moves = board_->GenerateLegalMoves();
+    e.valid = true;
+  }
+  return e.moves;
+}
+
+Move Node::GetEdgeMove(const Edge* edge, bool as_opponent) const {
+  assert(edges_);
+  const MoveList& moves = MaterializedMoves();
+  assert(edge->gen_idx_ < moves.size());
+  Move m = moves[edge->gen_idx_];
+  if (as_opponent) m.Flip();
   return m;
+}
+
+Move Node::GetOwnMove(bool as_opponent) const {
+  assert(parent_);
+  return parent_->GetEdgeMove(parent_->GetEdgeToNode(this), as_opponent);
 }
 
 // Policy priors (P) are stored in a compressed 16-bit format.
@@ -178,15 +212,15 @@ float Edge::GetP() const {
 
 std::string Edge::DebugString() const {
   std::ostringstream oss;
-  oss << "Move: " << move_.ToString(true) << " p_: " << p_
-      << " GetP: " << GetP();
+  oss << "GenIdx: " << gen_idx_ << " p_: " << p_ << " GetP: " << GetP();
   return oss.str();
 }
 
-std::unique_ptr<Edge[]> Edge::FromMovelist(const MoveList& moves) {
-  std::unique_ptr<Edge[]> edges = std::make_unique<Edge[]>(moves.size());
-  auto* edge = edges.get();
-  for (const auto move : moves) edge++->move_ = move;
+std::unique_ptr<Edge[]> Edge::MakeEdges(size_t count) {
+  std::unique_ptr<Edge[]> edges = std::make_unique<Edge[]>(count);
+  for (size_t i = 0; i < count; ++i) {
+    edges[i].gen_idx_ = static_cast<uint16_t>(i);
+  }
   return edges;
 }
 
@@ -194,30 +228,48 @@ std::unique_ptr<Edge[]> Edge::FromMovelist(const MoveList& moves) {
 // Node
 /////////////////////////////////////////////////////////////////////////
 
-Node* Node::CreateSingleChildNode(Move move) {
+Node* Node::CreateSingleChildNode(const ChessBoard& board, Move move) {
   assert(!edges_);
   assert(!child_);
-  edges_ = Edge::FromMovelist({move});
+  // Resolve the played move's index in the canonical generated list; the
+  // single edge must materialize back to exactly this move.
+  const MoveList legal = board.GenerateLegalMoves();
+  int idx = -1;
+  for (size_t i = 0; i < legal.size(); ++i) {
+    if (legal[i] == move) {
+      idx = static_cast<int>(i);
+      break;
+    }
+  }
+  if (idx < 0) {
+    throw Exception("CreateSingleChildNode: move " + move.ToString(true) +
+                    " not found in generated legal moves");
+  }
+  board_ = std::make_unique<ChessBoard>(board);
+  edges_ = Edge::MakeEdges(1);
+  edges_[0].gen_idx_ = static_cast<uint16_t>(idx);
   num_edges_ = 1;
   child_ = std::make_unique<Node>(this, 0);
   return child_.get();
 }
 
-void Node::CreateEdges(const MoveList& moves) {
+void Node::CreateEdges(const ChessBoard& board, const MoveList& moves) {
   assert(!edges_);
   assert(!child_);
+  board_ = std::make_unique<ChessBoard>(board);
   if (moves.size() > static_cast<size_t>(kMaxNumEdges)) {
     // Search scratch buffers are sized by kMaxNumEdges; a wider position must
     // degrade (search a subset) rather than overflow them. Loud so any real
     // occurrence is investigable — PyVariant remains the rules authority.
+    // Edges are index 0..kMaxNumEdges-1 of gen order, so materialization is
+    // unaffected by the clamp.
     CERR << "Warning: " << moves.size() << " legal moves exceeds kMaxNumEdges="
          << kMaxNumEdges << "; clamping (some moves unsearchable)";
-    MoveList clamped(moves.begin(), moves.begin() + kMaxNumEdges);
-    edges_ = Edge::FromMovelist(clamped);
+    edges_ = Edge::MakeEdges(kMaxNumEdges);
     num_edges_ = kMaxNumEdges;
     return;
   }
-  edges_ = Edge::FromMovelist(moves);
+  edges_ = Edge::MakeEdges(moves.size());
   num_edges_ = moves.size();
 }
 
@@ -475,6 +527,10 @@ std::string EdgeAndNode::DebugString() const {
 /////////////////////////////////////////////////////////////////////////
 
 void NodeTree::MakeMove(Move move) {
+  // The head's position, BEFORE the move is appended — needed if the head has
+  // no edge for this move yet (CreateSingleChildNode resolves the move's index
+  // in this position's generated move list).
+  const ChessBoard head_board = history_.Last().GetBoard();
   Node* new_head = nullptr;
   for (auto& n : current_head_->Edges()) {
     if (n.GetMove() == move) {
@@ -488,7 +544,8 @@ void NodeTree::MakeMove(Move move) {
   current_head_->ReleaseChildrenExceptOne(new_head);
   new_head = current_head_->child_.get();
   current_head_ =
-      new_head ? new_head : current_head_->CreateSingleChildNode(move);
+      new_head ? new_head
+               : current_head_->CreateSingleChildNode(head_board, move);
   history_.Append(move);
 }
 

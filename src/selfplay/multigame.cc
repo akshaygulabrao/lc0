@@ -186,7 +186,7 @@ void MultiSelfPlayGames::Play() {
       if (tree->IsBlackToMove() != blacks_move) continue;
       const auto& board = tree->GetPositionHistory().Last().GetBoard();
       auto legal_moves = board.GenerateLegalMoves();
-      tree->GetCurrentHead()->CreateEdges(legal_moves);
+      tree->GetCurrentHead()->CreateEdges(board, legal_moves);
       eval_->Gather(tree.get(), std::move(legal_moves));
     }
     eval_->Run();

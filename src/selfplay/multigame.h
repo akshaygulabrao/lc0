@@ -71,7 +71,7 @@ class MultiSelfPlayGames {
     bool flip = !trees_[index]->IsBlackToMove();
     for (classic::Node* node = trees_[index]->GetCurrentHead();
          node != trees_[index]->GetGameBeginNode(); node = node->GetParent()) {
-      moves.push_back(node->GetParent()->GetEdgeToNode(node)->GetMove(flip));
+      moves.push_back(node->GetOwnMove(flip));
       flip = !flip;
     }
     std::reverse(moves.begin(), moves.end());

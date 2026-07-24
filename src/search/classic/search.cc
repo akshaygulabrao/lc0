@@ -621,7 +621,7 @@ PositionHistory Search::GetPositionHistoryAtNode(const Node* node) const {
   PositionHistory history(played_history_);
   std::vector<Move> rmoves;
   for (const Node* n = node; n != root_node_; n = n->GetParent()) {
-    rmoves.push_back(n->GetOwnEdge()->GetMove());
+    rmoves.push_back(n->GetOwnMove());
   }
   for (auto it = rmoves.rbegin(); it != rmoves.rend(); it++) {
     history.Append(*it);
@@ -2049,7 +2049,7 @@ void SearchWorker::ExtendNode(Node* node, int /*depth*/,
   }
 
   // Add legal moves as edges of this node.
-  node->CreateEdges(legal_moves);
+  node->CreateEdges(board, legal_moves);
 }
 
 // 2b. Copy collisions into shared collisions.
