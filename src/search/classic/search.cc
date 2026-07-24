@@ -789,6 +789,10 @@ int Search::GumbelPickRootChild() {
   // Snapshot candidate stats (atomics; NStarted includes in-flight visits).
   std::vector<uint32_t> n(ncand, 0), nstarted(ncand, 0);
   std::vector<float> q(ncand, 0.0f);
+  // {wm:2} root: visited children store WL in the root's own frame. Unlike the
+  // display/eval readers above we pass a 0.0f fallback, so an UNVISITED edge
+  // yields exactly 0 and the flip is a no-op — that is why no GetN()>0 guard is
+  // needed here. Keep the 0.0f default if you touch this.
   const float qsign = root_same_mover_children_ ? -1.0f : 1.0f;
   {
     int idx = 0, filled = 0;

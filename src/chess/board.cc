@@ -113,11 +113,17 @@ Square Move::to() const {
 // ChessBoard
 // ---------------------------------------------------------------------------
 
-// run 23: the e8/d8 KK-vs-K endgame (runs 5/6 curriculum seed) — two kk towers
-// on d8 and e8 vs White's lone Ke1, White to move, no opening double-move
-// (no {wm:2}).
+// run 28: back to the OFFICIAL full Chessckers starting position (= PyVariant
+// STARTING_FEN, byte-identical) — full FIDE White (RNBQKBNR + pawns) vs Black's
+// 24 towers (ranks 6-8: Stones on 6 & 8 + a7/h7, Kings on b7-g7), White to move
+// with the opening DOUBLE-MOVE ({wm:2}); 20 legal opening moves. Same start as
+// runs 10/14/19. NOTE: {wm:2} makes the ply-0 root a SAME-MOVER edge — the
+// historical sign-flip bug site, and the branch Gumbel S2's qsign handles.
 const char* ChessBoard::kStartposFen =
-    "3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1";
+    "pppppppp/pkkkkkkp/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
+    "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
+    "a7:s,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:s,"
+    "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1 {wm:2}";
 const BitBoard ChessBoard::kPawnMask = BitBoard(0);  // unused (no en passant)
 
 void ChessBoard::SetFromFen(std::string_view fen, int* rule50_ply, int* moves) {
