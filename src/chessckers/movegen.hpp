@@ -438,6 +438,31 @@ inline HopApply apply_hop(uint64_t occupied, uint64_t occupied_white,
     return {occupied, occupied_white, std::move(stacks), std::move(land_stack)};
 }
 
+// §4.4 mid-chain mandate. Fires only for CADENCE-2 chains whose last hop came to
+// rest on a BOARD square, when some non-reverse direction legal for the CURRENT
+// top piece (i.e. after any mid-chain promotion) has a normal-landing
+// continuation: a non-ram cadence-2 hop onto an empty board square. When it
+// fires the chain must continue and the stop-here move is not emitted. A tower
+// resting on the rim is never forced; cadence >= 3 never forces, however many
+// captures remain. Mirrors PyVariant `_mid_chain_mandate_active`.
+inline bool mid_chain_mandate_active(uint64_t occupied, uint64_t occupied_white, long king_sq,
+                                     const StackMap& stacks, int cf, int cr,
+                                     const Tower& cur_stack, int ldf, int ldr, int cadence, int n,
+                                     bool landed_on_board) {
+    if (cadence != 2 || !landed_on_board) return false;
+    // White king captured -> game over, the chain ends (same short-circuit as the
+    // top of enumerate_chains_recursive). Without this guard the stop-move would
+    // be suppressed while the recursion emits nothing, deleting the move outright.
+    if (king_sq >= 0 && (occupied_white & (1ULL << king_sq)) == 0) return false;
+    // next_capture_options already drops rams (include_suicide=false) and the
+    // 180-degree reverse, and filters to the locked cadence. A board landing is
+    // exactly landing_square >= 0 (rim landings carry -1).
+    for (const auto& hop : next_capture_options(occupied, occupied_white, stacks, cf, cr, cur_stack,
+                                                true, ldf, ldr, n, true, cadence, false))
+        if (!hop.is_overshoot && hop.landing_square >= 0) return true;
+    return false;
+}
+
 inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_white, long king_sq,
                                        const StackMap& stacks, int chain_start,
                                        int cf, int cr, const Tower& cur_stack,
@@ -454,8 +479,11 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
     // push the hop, emit/recurse, pop. Enumeration order is unchanged.
     for (const auto& hop : options) {
         hops_so_far.push_back(hop);
-        results.push_back(build_final_move(chain_start, orig_stack, hops_so_far));
-        if (!hop.is_overshoot) {
+        if (hop.is_overshoot) {
+            // An overshoot ends the chain and never rests on a board square, so
+            // the mid-chain mandate cannot fire: always emit.
+            results.push_back(build_final_move(chain_start, orig_stack, hops_so_far));
+        } else {
             auto ap = apply_hop(occupied, occupied_white, stacks, cf, cr, cur_stack, hop);
             int nf, nr;
             if (hop.landing_square >= 0) {
@@ -466,6 +494,14 @@ inline void enumerate_chains_recursive(uint64_t occupied, uint64_t occupied_whit
                 nr = c10_rank(hop.landing_c10);
             }
             const int next_cadence = has_cadence ? cadence : hop.cadence;
+            // §4.4: emit the stop-here move only if the chain is not compelled to
+            // continue from the square it just reached. Evaluated on the POST-hop
+            // state (ap.land_stack) because a rank-1 promotion can unlock the very
+            // direction that forces the continuation.
+            if (!mid_chain_mandate_active(ap.occupied, ap.occupied_white, king_sq, ap.stacks, nf,
+                                          nr, ap.land_stack, hop.df, hop.dr, next_cadence, n,
+                                          hop.landing_square >= 0))
+                results.push_back(build_final_move(chain_start, orig_stack, hops_so_far));
             enumerate_chains_recursive(ap.occupied, ap.occupied_white, king_sq, ap.stacks,
                                        chain_start, nf, nr, ap.land_stack, true, hop.df, hop.dr,
                                        hops_so_far, true, next_cadence, n, orig_stack, results);
